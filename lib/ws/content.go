@@ -3,6 +3,7 @@ package ws
 import (
 	"encoding/json"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -19,19 +20,129 @@ type linkSpan struct {
 	E int `json:"e"`
 }
 
-// BuildContent wraps text in Mezon's content blob: {"t": ...} plus "lk" link
-// entities for every bare URL so clients render them clickable.
+type markSpan struct {
+	S    int    `json:"s"`
+	E    int    `json:"e"`
+	Type string `json:"type"`
+}
+
+// Bold with a non-empty, single-line body free of nested asterisks; inline
+// code on one line. Mirrors the Python worker's mezon_format.markdown_entities.
+var (
+	boldRE       = regexp.MustCompile(`\*\*([^*\n]+?)\*\*`)
+	inlineCodeRE = regexp.MustCompile("`[^`\n]+`")
+	fenceLineRE  = regexp.MustCompile("(?m)^[ \t]*```")
+)
+
+// BuildContent wraps text in Mezon's content blob: {"t": ...} plus "mk"
+// markdown entities (bold/code — clients render rich text from entity spans,
+// not markdown syntax; ** markers are stripped here while backtick spans keep
+// their backticks for the client to strip) and "lk" link entities for every
+// bare URL. Link spans are computed on the CLEANED text since marker
+// stripping shifts offsets.
 func BuildContent(text string) string {
-	spans := linkSpans(text)
-	if len(spans) == 0 {
-		blob, _ := json.Marshal(map[string]string{"t": text})
-		return string(blob)
+	clean, marks := markdownSpans(text)
+	links := linkSpans(clean)
+	out := map[string]any{"t": clean}
+	if len(marks) > 0 {
+		out["mk"] = marks
 	}
-	blob, _ := json.Marshal(struct {
-		T  string     `json:"t"`
-		Lk []linkSpan `json:"lk"`
-	}{T: text, Lk: spans})
+	if len(links) > 0 {
+		out["lk"] = links
+	}
+	blob, _ := json.Marshal(out)
 	return string(blob)
+}
+
+type region struct{ s, e int }
+
+// markdownSpans converts the markdown Mezon can't parse into mk entity spans
+// over the returned clean text (UTF-16 offsets):
+//   - fenced code blocks → type "t", span INCLUDING the fences, body untouched
+//   - inline code → type "s", span including the backticks
+//   - **bold** → type "b" over the unwrapped text; the ** markers are removed
+func markdownSpans(text string) (string, []markSpan) {
+	if text == "" {
+		return text, nil
+	}
+	fences := fenceRegions(text)
+	var inline []region
+	for _, loc := range inlineCodeRE.FindAllStringIndex(text, -1) {
+		if !inside(loc[0], fences) {
+			inline = append(inline, region{loc[0], loc[1]})
+		}
+	}
+	masked := append(append([]region{}, fences...), inline...)
+
+	type event struct {
+		s, e int
+		kind string
+		body string
+	}
+	var events []event
+	for _, f := range fences {
+		events = append(events, event{f.s, f.e, "t", text[f.s:f.e]})
+	}
+	for _, c := range inline {
+		events = append(events, event{c.s, c.e, "s", text[c.s:c.e]})
+	}
+	for _, loc := range boldRE.FindAllStringSubmatchIndex(text, -1) {
+		if inside(loc[0], masked) || inside(loc[1]-1, masked) {
+			continue
+		}
+		events = append(events, event{loc[0], loc[1], "b", text[loc[2]:loc[3]]})
+	}
+	if len(events) == 0 {
+		return text, nil
+	}
+	sort.Slice(events, func(i, j int) bool { return events[i].s < events[j].s })
+
+	var b strings.Builder
+	var spans []markSpan
+	outU16, pos := 0, 0
+	emit := func(chunk string) {
+		b.WriteString(chunk)
+		outU16 += utf16Len(chunk)
+	}
+	for _, ev := range events {
+		emit(text[pos:ev.s])
+		start := outU16
+		emit(ev.body)
+		spans = append(spans, markSpan{S: start, E: outU16, Type: ev.kind})
+		pos = ev.e
+	}
+	emit(text[pos:])
+	return b.String(), spans
+}
+
+// fenceRegions returns char spans of CLOSED fenced code blocks, fences
+// included. An unclosed fence is left alone — the client slices 3 chars off
+// both ends of a "t" span, which would corrupt unfenced text.
+func fenceRegions(text string) []region {
+	var regions []region
+	offset := 0
+	open := -1
+	for _, line := range strings.Split(text, "\n") {
+		if fenceLineRE.MatchString(line) {
+			if open < 0 {
+				open = offset
+			} else {
+				regions = append(regions, region{open, offset + len(line)})
+				open = -1
+			}
+		}
+		offset += len(line) + 1 // the split newline
+	}
+	return regions
+}
+
+func inside(pos int, regions []region) bool {
+	for _, r := range regions {
+		if r.s <= pos && pos < r.e {
+			return true
+		}
+	}
+	return false
 }
 
 // linkSpans returns the UTF-16 code-unit spans of bare URLs in text. Mezon

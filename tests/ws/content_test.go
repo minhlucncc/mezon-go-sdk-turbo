@@ -14,6 +14,11 @@ type contentBlob struct {
 		S int `json:"s"`
 		E int `json:"e"`
 	} `json:"lk"`
+	Mk []struct {
+		S    int    `json:"s"`
+		E    int    `json:"e"`
+		Type string `json:"type"`
+	} `json:"mk"`
 }
 
 func decodeBlob(tb testing.TB, raw string) contentBlob {
@@ -83,5 +88,72 @@ func TestBuildContentMultipleURLs(t *testing.T) {
 		if got := sliceUTF16(blob.T, span.S, span.E); got != want[i] {
 			t.Fatalf("span %d wrong: %q", i, got)
 		}
+	}
+}
+
+// ── mk markdown entities (mirrors Python mezon_format.markdown_entities) ────
+
+func TestBuildContentBoldStrippedWithSpan(t *testing.T) {
+	blob := decodeBlob(t, ws.BuildContent("**Quy định chung:** áp dụng cho Fresher."))
+	if blob.T != "Quy định chung: áp dụng cho Fresher." {
+		t.Fatalf("markers not stripped: %q", blob.T)
+	}
+	if len(blob.Mk) != 1 || blob.Mk[0].Type != "b" {
+		t.Fatalf("want one bold span, got %+v", blob.Mk)
+	}
+	if got := sliceUTF16(blob.T, blob.Mk[0].S, blob.Mk[0].E); got != "Quy định chung:" {
+		t.Fatalf("bold span covers %q", got)
+	}
+}
+
+func TestBuildContentInlineCodeKeepsBackticks(t *testing.T) {
+	blob := decodeBlob(t, ws.BuildContent("Chạy `uv sync` trước."))
+	if blob.T != "Chạy `uv sync` trước." {
+		t.Fatalf("text mutated: %q", blob.T)
+	}
+	if len(blob.Mk) != 1 || blob.Mk[0].Type != "s" {
+		t.Fatalf("want one single-backtick span, got %+v", blob.Mk)
+	}
+	if got := sliceUTF16(blob.T, blob.Mk[0].S, blob.Mk[0].E); got != "`uv sync`" {
+		t.Fatalf("code span covers %q", got)
+	}
+}
+
+func TestBuildContentFenceMasksBoldAndSpansFences(t *testing.T) {
+	text := "Xem:\n```python\nx = '**not bold**'\n```\nHết."
+	blob := decodeBlob(t, ws.BuildContent(text))
+	if blob.T != text {
+		t.Fatalf("fenced text mutated: %q", blob.T)
+	}
+	if len(blob.Mk) != 1 || blob.Mk[0].Type != "t" {
+		t.Fatalf("want one triple span, got %+v", blob.Mk)
+	}
+}
+
+func TestBuildContentBoldThenLinkOffsetsCompose(t *testing.T) {
+	blob := decodeBlob(t, ws.BuildContent("**Nguồn:** https://meknow.mezon.vn/references/abc"))
+	if len(blob.Mk) != 1 || len(blob.Lk) != 1 {
+		t.Fatalf("want 1 mk + 1 lk, got %+v %+v", blob.Mk, blob.Lk)
+	}
+	if got := sliceUTF16(blob.T, blob.Lk[0].S, blob.Lk[0].E); got != "https://meknow.mezon.vn/references/abc" {
+		t.Fatalf("lk span on cleaned text covers %q", got)
+	}
+}
+
+func TestBuildContentBoldAfterEmojiUTF16(t *testing.T) {
+	blob := decodeBlob(t, ws.BuildContent("😊 **chú ý**"))
+	if blob.T != "😊 chú ý" {
+		t.Fatalf("text: %q", blob.T)
+	}
+	// emoji = 2 UTF-16 units + space → bold starts at 3.
+	if blob.Mk[0].S != 3 {
+		t.Fatalf("bold span start = %d, want 3", blob.Mk[0].S)
+	}
+}
+
+func TestBuildContentUnbalancedBoldUntouched(t *testing.T) {
+	blob := decodeBlob(t, ws.BuildContent("Giá **chưa chốt"))
+	if blob.T != "Giá **chưa chốt" || len(blob.Mk) != 0 {
+		t.Fatalf("unbalanced bold mutated: %q %+v", blob.T, blob.Mk)
 	}
 }
