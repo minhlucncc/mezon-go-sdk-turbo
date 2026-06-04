@@ -5,7 +5,6 @@
 package ws
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -94,13 +93,13 @@ func (c *Conn) send(env *rtapi.Envelope) error {
 }
 
 // SendText sends a reply. content is plain text; it is wrapped in Mezon's
-// {"t": ...} content blob. ref (optional) makes it a reply-as-reference.
+// {"t": ...} content blob, with "lk" entities marking bare URLs so they
+// render clickable. ref (optional) makes it a reply-as-reference.
 func (c *Conn) SendText(channelID, clanID string, mode int32, isPublic bool, text string, ref *api.MessageRef) error {
-	blob, _ := json.Marshal(map[string]string{"t": text})
 	out := &rtapi.ChannelMessageSend{
 		ClanId:    clanID,
 		ChannelId: channelID,
-		Content:   string(blob),
+		Content:   BuildContent(text),
 		Mode:      mode,
 		IsPublic:  isPublic,
 	}
