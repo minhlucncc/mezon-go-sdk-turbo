@@ -91,6 +91,8 @@ func fromAPI(m *mezonapi.ApiChannelMessage) types.Message {
 		MessageID:    m.MessageId,
 		SenderID:     m.SenderId,
 		Content:      m.Content,
+		Mentions:     m.Mentions,
+		References:   m.References,
 		Username:     m.Username,
 		DisplayName:  m.DisplayName,
 		ClanNick:     m.ClanNick,

@@ -58,6 +58,8 @@ func fromProto(cm *api.ChannelMessage) types.Message {
 		MessageID:    cm.GetMessageId(),
 		SenderID:     cm.GetSenderId(),
 		Content:      cm.GetContent(),
+		Mentions:     cm.GetMentions(),
+		References:   cm.GetReferences(),
 		Username:     cm.GetUsername(),
 		DisplayName:  cm.GetDisplayName(),
 		ClanNick:     cm.GetClanNick(),

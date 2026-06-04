@@ -25,6 +25,16 @@ func (t Tier) String() string {
 	}
 }
 
+// ChannelTrigger is a per-channel answer rule the consumer applies before
+// handling a clan-channel message. Matcher is a Mezon channel id, "dm" or "*"
+// (global). Mode: "mention" (default), "pattern", or "all".
+type ChannelTrigger struct {
+	Matcher     string
+	ChannelType string
+	Mode        string
+	Patterns    []string
+}
+
 // BotRef identifies a bot and carries the bits the engine needs to connect and
 // route turns. It is a value type — cheap to copy, ~100 bytes.
 type BotRef struct {
@@ -35,6 +45,9 @@ type BotRef struct {
 	WorkspaceID  string
 	BotVersionID string
 	Plan         string // tenant plan: starter | pro | enterprise (priority weight)
+	// Per-channel answer triggers (portal channel settings); empty → the
+	// consumer's default gate applies.
+	ChannelTriggers []ChannelTrigger
 }
 
 // Message is the normalized inbound message, populated by either the WS partial
@@ -46,6 +59,8 @@ type Message struct {
 	MessageID    string
 	SenderID     string
 	Content      string // raw Mezon content blob (JSON {"t": "..."} typically)
+	Mentions     string // raw mentions blob (JSON [{"user_id": ...}, ...])
+	References   string // raw references blob (JSON [{"message_sender_id": ...}, ...])
 	Username     string
 	DisplayName  string
 	ClanNick     string
