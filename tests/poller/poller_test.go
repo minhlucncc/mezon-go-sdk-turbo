@@ -2,6 +2,7 @@ package poller_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -93,5 +94,85 @@ func TestPollOnceDedupsAcrossCalls(t *testing.T) {
 	p.PollOnce(ctx, bot, "tok")
 	if count != 1 {
 		t.Fatalf("dedup failed: emitted %d times", count)
+	}
+}
+
+func TestPollOnceContainsCallbackPanic(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	bot := types.BotRef{KeyID: "k1", BotUserID: "bot"}
+	st.AddChannel(ctx, "k1", "c1")
+	lister := &fakeLister{byChan: map[string][]types.Message{
+		"c1": {{MessageID: "m1", SenderID: "u1", ChannelID: "c1"}},
+	}}
+	p := poller.New(lister, st, func(types.BotRef, types.Message) {
+		panic("consumer bug")
+	}, 1000, 4, 20)
+
+	n, err := p.PollOnce(ctx, bot, "tok")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("message should still be counted despite callback panic, got %d", n)
+	}
+}
+
+type failingStore struct {
+	state.Store
+	failCursor    bool
+	failSeen      bool
+	failSetCursor bool
+}
+
+func (s failingStore) Cursor(ctx context.Context, keyID, channelID string) (string, error) {
+	if s.failCursor {
+		return "", errors.New("cursor unavailable")
+	}
+	return s.Store.Cursor(ctx, keyID, channelID)
+}
+
+func (s failingStore) Seen(ctx context.Context, keyID, msgID string) (bool, error) {
+	if s.failSeen {
+		return false, errors.New("dedup unavailable")
+	}
+	return s.Store.Seen(ctx, keyID, msgID)
+}
+
+func (s failingStore) SetCursor(ctx context.Context, keyID, channelID, cursor string) error {
+	if s.failSetCursor {
+		return errors.New("cursor write failed")
+	}
+	return s.Store.SetCursor(ctx, keyID, channelID, cursor)
+}
+
+func TestPollOnceFailsClosedWhenCacheUnavailable(t *testing.T) {
+	ctx := context.Background()
+
+	for name, st := range map[string]func(state.Store) state.Store{
+		"cursor":     func(base state.Store) state.Store { return failingStore{Store: base, failCursor: true} },
+		"dedup":      func(base state.Store) state.Store { return failingStore{Store: base, failSeen: true} },
+		"set_cursor": func(base state.Store) state.Store { return failingStore{Store: base, failSetCursor: true} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			base := newStore(t)
+			bot := types.BotRef{KeyID: "k1", BotUserID: "bot"}
+			if err := base.AddChannel(ctx, "k1", "c1"); err != nil {
+				t.Fatal(err)
+			}
+			lister := &fakeLister{byChan: map[string][]types.Message{
+				"c1": {{MessageID: "m1", SenderID: "u1", ChannelID: "c1"}},
+			}}
+			delivered := 0
+			p := poller.New(lister, st(base), func(types.BotRef, types.Message) {
+				delivered++
+			}, 1000, 4, 20)
+			if _, err := p.PollOnce(ctx, bot, "tok"); err == nil {
+				t.Fatal("expected cache error")
+			}
+			if name != "set_cursor" && delivered != 0 {
+				t.Fatalf("must not deliver without cache safety, delivered=%d", delivered)
+			}
+		})
 	}
 }

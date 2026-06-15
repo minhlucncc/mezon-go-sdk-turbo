@@ -66,7 +66,9 @@ func (s *RedisStore) Seen(ctx context.Context, keyID, msgID string) (bool, error
 	pipe := s.rdb.Pipeline()
 	pipe.ZRemRangeByRank(ctx, key, 0, -s.dedupCap-1)
 	pipe.Expire(ctx, key, s.ttl)
-	_, _ = pipe.Exec(ctx)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return false, err
+	}
 	return false, nil
 }
 

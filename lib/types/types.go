@@ -62,6 +62,7 @@ type Message struct {
 	Mentions     string // raw mentions blob (JSON [{"user_id": ...}, ...])
 	References   string // raw references blob (JSON [{"message_sender_id": ...}, ...])
 	Username     string
+	Avatar       string
 	DisplayName  string
 	ClanNick     string
 	ChannelLabel string

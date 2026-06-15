@@ -10,10 +10,6 @@ import (
 
 type contentBlob struct {
 	T  string `json:"t"`
-	Lk []struct {
-		S int `json:"s"`
-		E int `json:"e"`
-	} `json:"lk"`
 	Mk []struct {
 		S    int    `json:"s"`
 		E    int    `json:"e"`
@@ -42,18 +38,18 @@ func TestBuildContentPlainTextNoLk(t *testing.T) {
 	if blob.T != "Chào bạn! Mình sẵn sàng hỗ trợ." {
 		t.Fatalf("text mangled: %q", blob.T)
 	}
-	if len(blob.Lk) != 0 {
-		t.Fatalf("no lk expected for plain text: %+v", blob.Lk)
+	if len(blob.Mk) != 0 {
+		t.Fatalf("no mk expected for plain text: %+v", blob.Mk)
 	}
 }
 
 func TestBuildContentMarksURLSpans(t *testing.T) {
 	text := "Nguồn tham khảo:\n- Quy chế Đào tạo cho SE - v1: https://meknow.mezon.vn/references/abc"
 	blob := decodeBlob(t, ws.BuildContent(text))
-	if len(blob.Lk) != 1 {
-		t.Fatalf("expected 1 lk span, got %+v", blob.Lk)
+	if len(blob.Mk) != 1 || blob.Mk[0].Type != "lk" {
+		t.Fatalf("expected 1 lk mk span, got %+v", blob.Mk)
 	}
-	if got := sliceUTF16(blob.T, blob.Lk[0].S, blob.Lk[0].E); got != "https://meknow.mezon.vn/references/abc" {
+	if got := sliceUTF16(blob.T, blob.Mk[0].S, blob.Mk[0].E); got != "https://meknow.mezon.vn/references/abc" {
 		t.Fatalf("lk span does not slice back to the URL: %q", got)
 	}
 }
@@ -62,17 +58,17 @@ func TestBuildContentUTF16OffsetsAfterEmoji(t *testing.T) {
 	// 😊 is an astral char: 2 UTF-16 units. The span must still slice cleanly.
 	text := "Chúc bạn học tốt 😊 https://funix.edu.vn"
 	blob := decodeBlob(t, ws.BuildContent(text))
-	if len(blob.Lk) != 1 {
-		t.Fatalf("expected 1 lk span, got %+v", blob.Lk)
+	if len(blob.Mk) != 1 || blob.Mk[0].Type != "lk" {
+		t.Fatalf("expected 1 lk mk span, got %+v", blob.Mk)
 	}
-	if got := sliceUTF16(blob.T, blob.Lk[0].S, blob.Lk[0].E); got != "https://funix.edu.vn" {
+	if got := sliceUTF16(blob.T, blob.Mk[0].S, blob.Mk[0].E); got != "https://funix.edu.vn" {
 		t.Fatalf("lk span shifted by emoji: %q", got)
 	}
 }
 
 func TestBuildContentTrimsTrailingPunctuation(t *testing.T) {
 	blob := decodeBlob(t, ws.BuildContent("Xem https://funix.edu.vn/guide."))
-	if got := sliceUTF16(blob.T, blob.Lk[0].S, blob.Lk[0].E); got != "https://funix.edu.vn/guide" {
+	if got := sliceUTF16(blob.T, blob.Mk[0].S, blob.Mk[0].E); got != "https://funix.edu.vn/guide" {
 		t.Fatalf("trailing punctuation must be outside the span: %q", got)
 	}
 }
@@ -80,11 +76,14 @@ func TestBuildContentTrimsTrailingPunctuation(t *testing.T) {
 func TestBuildContentMultipleURLs(t *testing.T) {
 	text := "- A: https://x.vn/a\n- B: https://x.vn/b"
 	blob := decodeBlob(t, ws.BuildContent(text))
-	if len(blob.Lk) != 2 {
-		t.Fatalf("expected 2 lk spans, got %+v", blob.Lk)
+	if len(blob.Mk) != 2 {
+		t.Fatalf("expected 2 lk mk spans, got %+v", blob.Mk)
 	}
 	want := []string{"https://x.vn/a", "https://x.vn/b"}
-	for i, span := range blob.Lk {
+	for i, span := range blob.Mk {
+		if span.Type != "lk" {
+			t.Fatalf("span %d type = %q, want lk", i, span.Type)
+		}
 		if got := sliceUTF16(blob.T, span.S, span.E); got != want[i] {
 			t.Fatalf("span %d wrong: %q", i, got)
 		}
@@ -132,10 +131,13 @@ func TestBuildContentFenceMasksBoldAndSpansFences(t *testing.T) {
 
 func TestBuildContentBoldThenLinkOffsetsCompose(t *testing.T) {
 	blob := decodeBlob(t, ws.BuildContent("**Nguồn:** https://meknow.mezon.vn/references/abc"))
-	if len(blob.Mk) != 1 || len(blob.Lk) != 1 {
-		t.Fatalf("want 1 mk + 1 lk, got %+v %+v", blob.Mk, blob.Lk)
+	if len(blob.Mk) != 2 {
+		t.Fatalf("want 1 bold mk + 1 link mk, got %+v", blob.Mk)
 	}
-	if got := sliceUTF16(blob.T, blob.Lk[0].S, blob.Lk[0].E); got != "https://meknow.mezon.vn/references/abc" {
+	if blob.Mk[1].Type != "lk" {
+		t.Fatalf("second mark should be lk, got %+v", blob.Mk)
+	}
+	if got := sliceUTF16(blob.T, blob.Mk[1].S, blob.Mk[1].E); got != "https://meknow.mezon.vn/references/abc" {
 		t.Fatalf("lk span on cleaned text covers %q", got)
 	}
 }

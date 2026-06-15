@@ -1,0 +1,138 @@
+{
+  "inbound": [
+    {
+      "name": "clan channel message with mention",
+      "frame_b64": "MqEBCICggPbFodfaGBCBoID2xaHX2hgYgYDglYXIv8QZKICggJiQkpDhGDILbWluaC5sdWN2YW5CFHsidCI6IkBMb2NhbCBoZWxsbyJ9SgdnZW5lcmFsYgRNaW5oagRtaW5oggEOCgwQgKCA1JuUmNAcQAaSAScKJQiA7PS4gci/xBkaD3sidCI6ImVhcmxpZXIifTCAoIDUm5SY0BywAQLAAQE=",
+      "expect": {
+        "channel_id": "1780431535405535233",
+        "clan_id": "1780431535405535232",
+        "message_id": "1840000000000000001",
+        "sender_id": "1784059393956909056",
+        "username": "minh.lucvan",
+        "content": "{\"t\":\"@Local hello\"}",
+        "channel_label": "general",
+        "display_name": "Minh",
+        "clan_nick": "minh",
+        "mentions": "[{\"user_id\":\"2062754877070643200\",\"s\":0,\"e\":6}]",
+        "references": "[{\"message_id\":\"1839999999000000000\",\"message_sender_id\":\"2062754877070643200\",\"content\":\"{\\\"t\\\":\\\"earlier\\\"}\"}]",
+        "mode": 2,
+        "is_public": true
+      }
+    },
+    {
+      "name": "dm message (clan 0, private)",
+      "frame_b64": "Mj4Qw6CA9sWh19oYGIKA4JWFyL/EGSiAoICYkJKQ4RgyC21pbmgubHVjdmFuQg57InQiOiJoaSBib3QifbABBA==",
+      "expect": {
+        "channel_id": "1780431535405535299",
+        "clan_id": "",
+        "message_id": "1840000000000000002",
+        "sender_id": "1784059393956909056",
+        "username": "minh.lucvan",
+        "content": "{\"t\":\"hi bot\"}",
+        "channel_label": "",
+        "display_name": "",
+        "clan_nick": "",
+        "mentions": "",
+        "references": "",
+        "mode": 4,
+        "is_public": false
+      }
+    },
+    {
+      "name": "vietnamese unicode content",
+      "frame_b64": "MmgIgKCA9sWh19oYEIGggPbFodfaGBiDgOCVhci/xBkogKCAmJCSkOEYQid7InQiOiJjaOG6vyDEkeG7mSBi4bqjbyBsxrB1IGzDoCBnw6w/In1iD0zhu7FjIFbEg24gTWluaLABAsABAQ==",
+      "expect": {
+        "channel_id": "1780431535405535233",
+        "clan_id": "1780431535405535232",
+        "message_id": "1840000000000000003",
+        "sender_id": "1784059393956909056",
+        "username": "",
+        "content": "{\"t\":\"chế độ bảo lưu là gì?\"}",
+        "channel_label": "",
+        "display_name": "Lực Văn Minh",
+        "clan_nick": "",
+        "mentions": "",
+        "references": "",
+        "mode": 2,
+        "is_public": true
+      }
+    }
+  ],
+  "outbound": [
+    {
+      "name": "clan join",
+      "kind": "clan_join",
+      "clan_id": "1780431535405535232",
+      "expect_b64": "GgoIgKCA9sWh19oY"
+    },
+    {
+      "name": "typing indicator",
+      "kind": "typing",
+      "channel_id": "1780431535405535233",
+      "clan_id": "1780431535405535232",
+      "sender_id": "2062754877070643200",
+      "mode": 2,
+      "is_public": true,
+      "expect_b64": "wgEiCICggPbFodfaGBCBoID2xaHX2hgYgKCA1JuUmNAcIAIoAQ=="
+    },
+    {
+      "name": "plain channel send",
+      "kind": "send",
+      "channel_id": "1780431535405535233",
+      "clan_id": "1780431535405535232",
+      "mode": 2,
+      "is_public": true,
+      "content": "{\"t\":\"answer\"}",
+      "expect_b64": "QigIgKCA9sWh19oYEIGggPbFodfaGBoOeyJ0IjoiYW5zd2VyIn04AlgB"
+    },
+    {
+      "name": "send with creator mention",
+      "kind": "send",
+      "channel_id": "1780431535405535233",
+      "clan_id": "1780431535405535232",
+      "mode": 2,
+      "is_public": true,
+      "content": "{\"t\":\"@bạn digest\"}",
+      "mention": {
+        "user_id": "1784059393956909056",
+        "s": 0,
+        "e": 4
+      },
+      "expect_b64": "Qj0IgKCA9sWh19oYEIGggPbFodfaGBoVeyJ0IjoiQGLhuqFuIGRpZ2VzdCJ9IgwQgKCAmJCSkOEYQAQ4AlgB"
+    },
+    {
+      "name": "send with reply reference",
+      "kind": "send",
+      "channel_id": "1780431535405535233",
+      "clan_id": "1780431535405535232",
+      "mode": 2,
+      "is_public": true,
+      "content": "{\"t\":\"answer\"}",
+      "ref": {
+        "ref_message_id": "1840000000000000001",
+        "sender_id": "1784059393956909056",
+        "sender_username": "minh",
+        "content": "{\"t\":\"@Local hello\"}"
+      },
+      "expect_b64": "QloIgKCA9sWh19oYEIGggPbFodfaGBoOeyJ0IjoiYW5zd2VyIn0yMBCBgOCVhci/xBkaFHsidCI6IkBMb2NhbCBoZWxsbyJ9MICggJiQkpDhGDoEbWluaDgCWAE="
+    },
+    {
+      "name": "send mention everyone (dm-safe zero clan)",
+      "kind": "send",
+      "channel_id": "1780431535405535299",
+      "clan_id": "0",
+      "mode": 4,
+      "is_public": false,
+      "content": "{\"t\":\"@here digest\"}",
+      "mention_everyone": true,
+      "expect_b64": "QiQQw6CA9sWh19oYGhR7InQiOiJAaGVyZSBkaWdlc3QifTgESAE="
+    }
+  ],
+  "clan_desc_list": {
+    "frame_b64": "ClEIgKCA9sWh19oYEghEZW1vIEJvdBoxaHR0cHM6Ly9jZG4ubWV6b24uYWkvMTc4MDQzMTUzNTQwNTUzNTIzMi9sb2dvLnBuZyiAoICywdfXzRwKIQiAoID2xaHX2hgSC1NlY29uZCBDbGFuKJGhgLLB19fNHA==",
+    "expect_clan_ids": [
+      "2061345416372293632",
+      "2061345416372293777"
+    ]
+  }
+}

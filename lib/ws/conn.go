@@ -13,22 +13,31 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"google.golang.org/protobuf/proto"
-
-	"github.com/nccasia/mezon-go-sdk/mezon-protobuf/mezon/v2/common/api"
-	"github.com/nccasia/mezon-go-sdk/mezon-protobuf/mezon/v2/common/rtapi"
 
 	"github.com/mezon/mezon-go-sdk-turbo/lib/types"
 )
 
-// leanDialer keeps per-connection buffers small — bot messages are tiny, so the
-// gorilla default 4 KB read/write buffers are pure waste at thousands of sockets.
+// writeBufferPool is shared across all sockets so a generous write buffer costs
+// memory only during an actual write (returned to the pool after), not
+// per-connection — keeping the lean-socket memory profile at thousands of bots.
+var writeBufferPool = &sync.Pool{}
+
+// leanDialer keeps the per-connection READ buffer small (inbound bot messages are
+// tiny). The WRITE buffer, however, must be large enough to hold a whole outbound
+// message in ONE WebSocket frame: gorilla fragments any message larger than
+// WriteBufferSize into continuation frames, and the Mezon gateway silently DROPS
+// fragmented messages — so a long grounded answer (>1 KB) never arrived while
+// short greetings did. A shared pool gives the headroom without per-socket cost.
+// Subprotocol "protobuf" matches the Python SDK's handshake (probe-verified on
+// the live server alongside the format=protobuf query param).
 var leanDialer = &websocket.Dialer{
 	ReadBufferSize:    1024,
-	WriteBufferSize:   1024,
+	WriteBufferSize:   65536,
+	WriteBufferPool:   writeBufferPool,
 	EnableCompression: false,
 	HandshakeTimeout:  15 * time.Second,
 	Proxy:             http.ProxyFromEnvironment,
+	Subprotocols:      []string{"protobuf"},
 }
 
 // Conn is one hot bot socket.
@@ -36,13 +45,18 @@ type Conn struct {
 	ws        *websocket.Conn
 	botUserID string
 	onMessage func(types.Message)
+	onClose   func()
 	writeMu   sync.Mutex
 	closed    atomic.Bool
+	pingCid   atomic.Uint64 // keepalive request ids (server requires them)
 }
 
 // Dial opens a lean WebSocket as a bot identity and starts the read loop. The
-// caller registers the returned Conn with a PingWheel for keepalive.
-func Dial(host string, ssl bool, token, botUserID string, clanIDs []string, onMessage func(types.Message)) (*Conn, error) {
+// caller registers the returned Conn with a PingWheel for keepalive. onClose
+// (may be nil) fires exactly once when the read loop ends — the OWNER must
+// evict the conn and re-dial, or the bot goes permanently deaf while still
+// looking hot (the 2026-06-06 "works once then dies" regression).
+func Dial(host string, ssl bool, token, botUserID string, clanIDs []string, onMessage func(types.Message), onClose func()) (*Conn, error) {
 	scheme := "wss"
 	if !ssl {
 		scheme = "ws"
@@ -53,19 +67,24 @@ func Dial(host string, ssl bool, token, botUserID string, clanIDs []string, onMe
 	if err != nil {
 		return nil, err
 	}
-	c := &Conn{ws: raw, botUserID: botUserID, onMessage: onMessage}
+	c := &Conn{ws: raw, botUserID: botUserID, onMessage: onMessage, onClose: onClose}
 	for _, id := range clanIDs {
-		_ = c.send(&rtapi.Envelope{Message: &rtapi.Envelope_ClanJoin{ClanJoin: &rtapi.ClanJoin{ClanId: id}}})
+		_ = c.send(BuildClanJoinEnvelope(id))
 	}
 	go c.readLoop()
 	return c, nil
 }
 
 func (c *Conn) readLoop() {
+	defer func() {
+		c.closed.Store(true)
+		if c.onClose != nil {
+			c.onClose()
+		}
+	}()
 	for {
 		_, data, err := c.ws.ReadMessage()
 		if err != nil {
-			c.closed.Store(true)
 			return
 		}
 		msg, ok, derr := DecodeChannelMessage(data)
@@ -75,52 +94,48 @@ func (c *Conn) readLoop() {
 		if msg.SenderID == c.botUserID {
 			continue // never react to our own messages
 		}
+		c.emit(msg)
+	}
+}
+
+func (c *Conn) emit(msg types.Message) {
+	defer func() { _ = recover() }()
+	if c.onMessage != nil {
 		c.onMessage(msg)
 	}
 }
 
-func (c *Conn) send(env *rtapi.Envelope) error {
+func (c *Conn) send(env []byte) error {
 	if c.closed.Load() {
 		return websocket.ErrCloseSent
 	}
-	data, err := proto.Marshal(env)
-	if err != nil {
-		return err
-	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return c.ws.WriteMessage(websocket.BinaryMessage, data)
+	return c.ws.WriteMessage(websocket.BinaryMessage, env)
 }
 
 // SendText sends a reply. content is plain text; it is wrapped in Mezon's
 // {"t": ...} content blob, with "lk" entities marking bare URLs so they
 // render clickable. ref (optional) makes it a reply-as-reference.
-func (c *Conn) SendText(channelID, clanID string, mode int32, isPublic bool, text string, ref *api.MessageRef) error {
-	out := &rtapi.ChannelMessageSend{
-		ClanId:    clanID,
-		ChannelId: channelID,
-		Content:   BuildContent(text),
-		Mode:      mode,
-		IsPublic:  isPublic,
-	}
-	if ref != nil {
-		out.References = []*api.MessageRef{ref}
-	}
-	return c.send(&rtapi.Envelope{Message: &rtapi.Envelope_ChannelMessageSend{ChannelMessageSend: out}})
+func (c *Conn) SendText(channelID, clanID string, mode int32, isPublic bool, text string, ref *Ref) error {
+	return c.SendTextOpts(channelID, clanID, mode, isPublic, text, SendOpts{Ref: ref})
+}
+
+// SendTextOpts is SendText with full delivery decorations (mentions,
+// mention_everyone) — used by scheduled-task outbound deliveries.
+func (c *Conn) SendTextOpts(channelID, clanID string, mode int32, isPublic bool, text string, opts SendOpts) error {
+	return c.send(BuildSendEnvelope(channelID, clanID, mode, isPublic, text, opts))
 }
 
 // SendTyping emits a typing indicator.
 func (c *Conn) SendTyping(channelID, clanID, senderID string, mode int32, isPublic bool) error {
-	return c.send(&rtapi.Envelope{Message: &rtapi.Envelope_MessageTypingEvent{
-		MessageTypingEvent: &rtapi.MessageTypingEvent{
-			ClanId: clanID, ChannelId: channelID, SenderId: senderID, Mode: mode, IsPublic: isPublic,
-		},
-	}})
+	return c.send(BuildTypingEnvelope(channelID, clanID, senderID, mode, isPublic))
 }
 
-// ping sends a keepalive (called by the PingWheel).
+// ping sends a keepalive (called by the PingWheel). Pings carry an
+// incrementing cid — the live server reaps sockets with cid-less pings.
 func (c *Conn) ping() error {
-	return c.send(&rtapi.Envelope{Message: &rtapi.Envelope_Ping{Ping: &rtapi.Ping{}}})
+	return c.send(BuildPingEnvelopeWithCid(c.pingCid.Add(1)))
 }
 
 // Close tears the socket down.

@@ -7,14 +7,15 @@ package turbo
 
 import (
 	"context"
+	"log"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 
-	"github.com/nccasia/mezon-go-sdk/mezon-protobuf/mezon/v2/common/api"
-
 	"github.com/mezon/mezon-go-sdk-turbo/lib/poller"
+	"github.com/mezon/mezon-go-sdk-turbo/lib/rest"
 	"github.com/mezon/mezon-go-sdk-turbo/lib/state"
 	"github.com/mezon/mezon-go-sdk-turbo/lib/tier"
 	"github.com/mezon/mezon-go-sdk-turbo/lib/types"
@@ -34,6 +35,31 @@ type Config struct {
 	PingInterval  time.Duration
 }
 
+// Authenticator exchanges a bot's API key for a session (rest.Client
+// satisfies it). Mezon's WS handshake and message-list endpoints only accept
+// SESSION tokens — the raw key fails with "bad handshake"/401.
+type Authenticator interface {
+	Authenticate(ctx context.Context, appID, apiKey string) (rest.Session, error)
+}
+
+// ClanLister fetches the clans a bot has joined (rest.Client satisfies it).
+// The socket only delivers messages for clans the connection explicitly
+// JOINS after dialing — without ClanJoin frames a connected bot hears nothing.
+type ClanLister interface {
+	ListClanIDs(ctx context.Context, baseURL, sessionToken string) ([]string, error)
+}
+
+// sessionTTL bounds how long an exchanged session token is reused before
+// re-authenticating. Dial failures also drop the cached session immediately.
+const sessionTTL = 30 * time.Minute
+
+type cachedSession struct {
+	token   string
+	wsHost  string   // session-provided socket host (e.g. sock.mezon.ai)
+	clanIDs []string // joined clans + "0" (DM space) — ClanJoin targets
+	fetched time.Time
+}
+
 // Engine is the resource-aware Mezon client.
 type Engine struct {
 	cfg       Config
@@ -42,14 +68,20 @@ type Engine struct {
 	mgr       *tier.Manager
 	pw        *ws.PingWheel
 	onMessage func(types.BotRef, types.Message)
+	auth      Authenticator // nil → raw tokens (tests/legacy)
+	clans     ClanLister    // nil → dial joins no clans
 
-	mu  sync.Mutex
-	hot map[string]*ws.Conn
+	mu       sync.Mutex
+	hot      map[string]*ws.Conn
+	opening  map[string]struct{}
+	sessions map[string]cachedSession // keyID → exchanged session
 }
 
 // New builds an engine. lister is the REST capability (rest.New(apiBase)
 // satisfies it); onMessage receives every new inbound message (from a socket or
-// a poll) — it is the consumer's turn entrypoint.
+// a poll) — it is the consumer's turn entrypoint. When lister also implements
+// Authenticator (rest.Client does), bot API keys are exchanged for session
+// tokens before any dial or poll.
 func New(cfg Config, rdb redis.Cmdable, lister poller.Lister, onMessage func(types.BotRef, types.Message)) *Engine {
 	e := &Engine{
 		cfg:       cfg,
@@ -57,13 +89,75 @@ func New(cfg Config, rdb redis.Cmdable, lister poller.Lister, onMessage func(typ
 		pw:        ws.NewPingWheel(cfg.PingInterval),
 		onMessage: onMessage,
 		hot:       make(map[string]*ws.Conn),
+		opening:   make(map[string]struct{}),
+		sessions:  make(map[string]cachedSession),
+	}
+	if auth, ok := lister.(Authenticator); ok {
+		e.auth = auth
+	}
+	if cl, ok := lister.(ClanLister); ok {
+		e.clans = cl
 	}
 	e.poller = poller.New(lister, e.store, e.onPollMessage, cfg.PollRPS, cfg.PollWorkers, cfg.PollPageLimit)
 	e.mgr = tier.New(cfg.Tier, e) // Engine implements tier.Actuator
 	return e
 }
 
-// Register adds a bot (starts Cold; the manager promotes it on activity).
+// session returns the bot's session token and the WS host to dial, exchanging
+// (and caching) its API key on first use or after expiry. The session response
+// ROUTES the socket: live, gw.mezon.ai authenticates but sock.mezon.ai serves
+// the WS — dialing the auth host gets "bad handshake". Falls back to the raw
+// token + configured host when no Authenticator is wired or the exchange
+// fails, so the subsequent dial fails loudly instead of silently dropping.
+func (e *Engine) session(bot types.BotRef) (token, wsHost string, clanIDs []string) {
+	if e.auth == nil {
+		return bot.BotToken, e.cfg.WSHost, nil
+	}
+	e.mu.Lock()
+	s, ok := e.sessions[bot.KeyID]
+	e.mu.Unlock()
+	if ok && time.Since(s.fetched) < sessionTTL {
+		return s.token, s.wsHost, s.clanIDs
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	sess, err := e.auth.Authenticate(ctx, bot.BotUserID, bot.BotToken)
+	if err != nil {
+		log.Printf("authenticate failed (bot=%s key=%s): %v — using raw token", bot.BotUserID, bot.KeyID, err)
+		return bot.BotToken, e.cfg.WSHost, nil
+	}
+	wsHost = strings.TrimPrefix(strings.TrimPrefix(sess.WSURL, "wss://"), "ws://")
+	if wsHost == "" {
+		wsHost = e.cfg.WSHost
+	}
+	// "0" is the DM space (official SDK convention); clan messages need an
+	// explicit ClanJoin per joined clan or the socket stays silent.
+	clanIDs = []string{"0"}
+	if e.clans != nil {
+		ids, err := e.clans.ListClanIDs(ctx, sess.APIURL, sess.Token)
+		if err != nil {
+			log.Printf("list clans failed (bot=%s key=%s): %v — joining DM space only", bot.BotUserID, bot.KeyID, err)
+		} else {
+			clanIDs = append(clanIDs, ids...)
+		}
+	}
+	e.mu.Lock()
+	e.sessions[bot.KeyID] = cachedSession{token: sess.Token, wsHost: wsHost, clanIDs: clanIDs, fetched: time.Now()}
+	e.mu.Unlock()
+	return sess.Token, wsHost, clanIDs
+}
+
+// dropSession forgets a bot's cached session (e.g. after a failed dial — the
+// token may have expired server-side before our TTL).
+func (e *Engine) dropSession(keyID string) {
+	e.mu.Lock()
+	delete(e.sessions, keyID)
+	e.mu.Unlock()
+}
+
+// Register adds a bot. New bots are treated as just-active so the next
+// rebalance opens their socket (budget permitting) — see Manager.Add for the
+// cold-start rationale; idle bots then decay to warm/cold polling.
 func (e *Engine) Register(bot types.BotRef) { e.mgr.Add(bot) }
 
 // AddChannel registers a channel id to poll for a bot. Channels are normally
@@ -106,6 +200,7 @@ func (e *Engine) deliver(bot types.BotRef, msg types.Message) {
 	_ = e.store.AddChannel(ctx, bot.KeyID, msg.ChannelID) // learn channels to poll
 	e.mgr.Touch(bot.KeyID)                                // bump activity -> maybe promote
 	if e.onMessage != nil {
+		defer func() { _ = recover() }()
 		e.onMessage(bot, msg)
 	}
 }
@@ -116,21 +211,75 @@ func (e *Engine) deliver(bot types.BotRef, msg types.Message) {
 // on dial failure the bot is demoted back to Warm).
 func (e *Engine) OpenHot(bot types.BotRef) {
 	e.mu.Lock()
-	_, exists := e.hot[bot.KeyID]
-	e.mu.Unlock()
-	if exists {
+	if existing := e.hot[bot.KeyID]; existing != nil && !existing.Closed() {
+		e.mu.Unlock()
 		return
 	}
-	conn, err := ws.Dial(e.cfg.WSHost, e.cfg.WSSSL, bot.BotToken, bot.BotUserID, nil,
-		func(m types.Message) { e.onHotMessage(bot, m) })
-	if err != nil {
-		e.mgr.ForceTier(bot.KeyID, types.Warm)
+	if _, exists := e.opening[bot.KeyID]; exists {
+		e.mu.Unlock()
 		return
 	}
-	e.pw.Add(conn)
-	e.mu.Lock()
-	e.hot[bot.KeyID] = conn
+	e.opening[bot.KeyID] = struct{}{}
 	e.mu.Unlock()
+
+	go func() {
+		token, wsHost, clanIDs := e.session(bot)
+		// onClose evicts the dead conn and re-arms the tier manager so the
+		// next rebalance re-dials — without it the bot stays "Hot" with a
+		// zombie socket and is permanently deaf (silent: read loops don't log).
+		onClose := func() {
+			// Distinguish UNEXPECTED death (server drop, network blip — the
+			// conn is still registered) from an intentional CloseHot
+			// (deregister/demote already removed it): only the former re-arms,
+			// otherwise a demoted bot Touch-refreshes itself and oscillates.
+			e.mu.Lock()
+			c := e.hot[bot.KeyID]
+			unexpected := c != nil && c.Closed()
+			if unexpected {
+				delete(e.hot, bot.KeyID)
+				e.pw.Remove(c)
+			}
+			e.mu.Unlock()
+			if !unexpected {
+				return
+			}
+			log.Printf("hot socket closed (bot=%s key=%s) — re-dialing", bot.BotUserID, bot.KeyID)
+			e.dropSession(bot.KeyID) // session may have been invalidated server-side
+			e.mgr.ForceTier(bot.KeyID, types.Warm)
+			e.mgr.Touch(bot.KeyID) // fresh activity → immediate re-promotion → re-dial
+		}
+		conn, err := ws.Dial(wsHost, e.cfg.WSSSL, token, bot.BotUserID, clanIDs,
+			func(m types.Message) { e.onHotMessage(bot, m) }, onClose)
+		if err != nil {
+			// Loud on purpose: a bad token or unreachable WS host otherwise
+			// looks identical to a healthy idle bot from the outside.
+			log.Printf("hot dial failed (bot=%s key=%s host=%s): %v — demoting to warm",
+				bot.BotUserID, bot.KeyID, wsHost, err)
+			e.dropSession(bot.KeyID) // may have expired server-side
+			e.mu.Lock()
+			delete(e.opening, bot.KeyID)
+			e.mu.Unlock()
+			e.mgr.ForceTier(bot.KeyID, types.Warm)
+			return
+		}
+		log.Printf("hot socket open (bot=%s key=%s clans=%v)", bot.BotUserID, bot.KeyID, clanIDs)
+
+		e.mu.Lock()
+		if _, stillWanted := e.opening[bot.KeyID]; !stillWanted {
+			e.mu.Unlock()
+			_ = conn.Close()
+			return
+		}
+		delete(e.opening, bot.KeyID)
+		if existing := e.hot[bot.KeyID]; existing != nil && !existing.Closed() {
+			e.mu.Unlock()
+			_ = conn.Close()
+			return
+		}
+		e.hot[bot.KeyID] = conn
+		e.pw.Add(conn)
+		e.mu.Unlock()
+	}()
 }
 
 // CloseHot tears down a bot's live socket.
@@ -138,6 +287,7 @@ func (e *Engine) CloseHot(keyID string) {
 	e.mu.Lock()
 	conn := e.hot[keyID]
 	delete(e.hot, keyID)
+	delete(e.opening, keyID)
 	e.mu.Unlock()
 	if conn != nil {
 		e.pw.Remove(conn)
@@ -147,7 +297,8 @@ func (e *Engine) CloseHot(keyID string) {
 
 // Poll runs one REST poll for a warm/cold bot.
 func (e *Engine) Poll(bot types.BotRef) {
-	e.poller.Submit(context.Background(), bot, bot.BotToken, nil)
+	token, _, _ := e.session(bot)
+	e.poller.Submit(context.Background(), bot, token, nil)
 }
 
 // ── outbound (used by the consumer's turn handler) ──────────────────────────
@@ -155,23 +306,42 @@ func (e *Engine) Poll(bot types.BotRef) {
 // Send replies to a message. If the bot is hot it goes over the live socket;
 // otherwise a transient lean socket is opened to send, then closed.
 func (e *Engine) Send(bot types.BotRef, in types.Message, text string, asReply bool) error {
-	var ref *api.MessageRef
+	var ref *ws.Ref
 	if asReply && !in.IsDM() {
-		ref = &api.MessageRef{MessageId: in.MessageID, MessageSenderId: in.SenderID, Content: in.Content}
+		username := in.ClanNick
+		if username == "" {
+			username = in.DisplayName
+		}
+		if username == "" {
+			username = in.Username
+		}
+		ref = &ws.Ref{
+			RefMessageID: in.MessageID, SenderID: in.SenderID,
+			SenderUsername: username, SenderAvatar: in.Avatar, Content: in.Content,
+		}
 	}
+	return e.SendTo(bot, in.ChannelID, in.ClanID, in.Mode, in.IsPublic, text, ws.SendOpts{Ref: ref})
+}
+
+// SendTo posts to an explicit channel — no inbound message required. Used for
+// scheduler-produced outbound deliveries, where the caller supplies the
+// channel coordinates (and mode/is_public from the channel-meta cache) plus
+// any mention decorations. Hot socket when available, transient otherwise.
+func (e *Engine) SendTo(bot types.BotRef, channelID, clanID string, mode int32, isPublic bool, text string, opts ws.SendOpts) error {
 	e.mu.Lock()
 	conn := e.hot[bot.KeyID]
 	e.mu.Unlock()
 	if conn != nil && !conn.Closed() {
-		return conn.SendText(in.ChannelID, in.ClanID, in.Mode, in.IsPublic, text, ref)
+		return conn.SendTextOpts(channelID, clanID, mode, isPublic, text, opts)
 	}
 	// Fallback: transient socket (rare — only when hot slots are saturated).
-	tmp, err := ws.Dial(e.cfg.WSHost, e.cfg.WSSSL, bot.BotToken, bot.BotUserID, nil, func(types.Message) {})
+	token, wsHost, clanIDs := e.session(bot)
+	tmp, err := ws.Dial(wsHost, e.cfg.WSSSL, token, bot.BotUserID, clanIDs, func(types.Message) {}, nil)
 	if err != nil {
 		return err
 	}
 	defer tmp.Close()
-	return tmp.SendText(in.ChannelID, in.ClanID, in.Mode, in.IsPublic, text, ref)
+	return tmp.SendTextOpts(channelID, clanID, mode, isPublic, text, opts)
 }
 
 // SendTyping emits a typing indicator if the bot is hot (no-op otherwise).

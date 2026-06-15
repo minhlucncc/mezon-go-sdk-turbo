@@ -66,22 +66,26 @@ func TestPerTenantFairness(t *testing.T) {
 }
 
 func TestIdleDemotion(t *testing.T) {
+	// Decay is pressure-driven: demotion applies only when the hot budget is
+	// CONTENDED (a fresher bot wants the slot). Spare capacity keeps idle
+	// bots hot — see TestSpareHotCapacityKeepsIdleBotsHot.
 	act := &fakeAct{}
 	now := time.Unix(1000, 0)
 	clock := func() time.Time { return now }
-	m := tier.New(tier.Config{MaxHot: 5, HotIdle: 2 * time.Minute, WarmIdle: 10 * time.Minute, Now: clock}, act)
+	m := tier.New(tier.Config{MaxHot: 1, HotIdle: 2 * time.Minute, WarmIdle: 10 * time.Minute, Now: clock}, act)
 	m.Add(bot("a", "t1", "pro"))
 	m.Touch("a")
 	if m.TierOf("a") != types.Hot {
 		t.Fatal("active bot should be hot")
 	}
-	now = now.Add(3 * time.Minute) // past HotIdle
-	m.Rebalance()
+	now = now.Add(3 * time.Minute) // a past HotIdle
+	m.Add(bot("b", "t2", "pro"))   // fresh rival contends for the only slot
+	m.Touch("b")
 	if m.TierOf("a") != types.Warm {
-		t.Fatalf("idle past HotIdle should demote to warm, got %s", m.TierOf("a"))
+		t.Fatalf("idle past HotIdle should yield under pressure, got %s", m.TierOf("a"))
 	}
-	now = now.Add(11 * time.Minute) // past WarmIdle
-	m.Rebalance()
+	now = now.Add(11 * time.Minute) // a past WarmIdle; keep b fresh
+	m.Touch("b")
 	if m.TierOf("a") != types.Cold {
 		t.Fatalf("idle past WarmIdle should demote to cold, got %s", m.TierOf("a"))
 	}
@@ -121,9 +125,18 @@ func TestMemoryWatermarkEvicts(t *testing.T) {
 func TestColdBotsArePolled(t *testing.T) {
 	act := &fakeAct{}
 	now := time.Unix(1000, 0)
-	m := tier.New(tier.Config{MaxHot: 5, ColdPoll: time.Minute, Now: func() time.Time { return now }}, act)
-	m.Add(bot("a", "t1", "pro")) // never touched -> cold
+	m := tier.New(tier.Config{
+		MaxHot: 1, ColdPoll: time.Minute,
+		HotIdle: time.Minute, WarmIdle: 5 * time.Minute,
+		Now: func() time.Time { return now },
+	}, act)
+	// New bots start hot (cold-start fix); decay needs CONTENTION now, so a
+	// fresher rival takes the only slot and "a" falls through warm to cold.
+	m.Add(bot("a", "t1", "pro"))
 	m.Rebalance()
+	now = now.Add(6 * time.Minute) // a past WarmIdle
+	m.Add(bot("rival", "t2", "pro"))
+	m.Touch("rival") // takes the slot; a decays cold + first due poll
 	act.mu.Lock()
 	polled := len(act.polled)
 	act.mu.Unlock()
@@ -136,5 +149,121 @@ func TestColdBotsArePolled(t *testing.T) {
 	act.mu.Unlock()
 	if polled2 != 1 {
 		t.Fatalf("cold bot should not be re-polled before interval, got %d", polled2)
+	}
+}
+
+// A freshly-added bot must be promoted to Hot on the next rebalance (budget
+// permitting) WITHOUT waiting for inbound activity. A new bot has no known
+// channels, so warm/cold REST polling is a no-op for it — if registration
+// doesn't open the socket, the bot can never see its first message and is
+// dead forever (cold-start deadlock). Mirrors the Python worker, which opened
+// one listener per key immediately.
+func TestNewBotPromotedToHotOnAdd(t *testing.T) {
+	act := &fakeAct{}
+	now := time.Unix(1000, 0)
+	m := tier.New(tier.Config{MaxHot: 10, Now: func() time.Time { return now }}, act)
+
+	m.Add(bot("fresh", "t1", "pro"))
+	m.Rebalance()
+
+	act.mu.Lock()
+	opened := append([]string(nil), act.opened...)
+	act.mu.Unlock()
+	if len(opened) != 1 || opened[0] != "fresh" {
+		t.Fatalf("new bot must open a hot socket on the first rebalance, got opened=%v", opened)
+	}
+}
+
+// The promotion is budget-bound: with no hot slots free, a new bot still must
+// not sit Cold (it would deadlock) — it lands Warm at worst.
+func TestNewBotBeyondBudgetStaysOutOfCold(t *testing.T) {
+	act := &fakeAct{}
+	now := time.Unix(1000, 0)
+	m := tier.New(tier.Config{MaxHot: 1, Now: func() time.Time { return now }}, act)
+	m.Add(bot("a", "t1", "pro"))
+	m.Touch("a") // occupies the only hot slot with a higher rate score
+	m.Add(bot("fresh", "t2", "pro"))
+	m.Rebalance()
+
+	if got := m.HotCount(); got != 1 {
+		t.Fatalf("budget must hold, hot=%d", got)
+	}
+}
+
+// Idle decay still applies UNDER PRESSURE: a never-active bot yields its hot
+// slot to a fresher rival once the budget is contended.
+func TestNewBotDecaysWhenIdle(t *testing.T) {
+	act := &fakeAct{}
+	now := time.Unix(1000, 0)
+	m := tier.New(tier.Config{
+		MaxHot: 1, HotIdle: time.Minute, WarmIdle: 10 * time.Minute,
+		Now: func() time.Time { return now },
+	}, act)
+	m.Add(bot("fresh", "t1", "pro"))
+	m.Rebalance()
+
+	now = now.Add(11 * time.Minute) // past WarmIdle
+	m.Add(bot("rival", "t2", "pro"))
+	m.Touch("rival") // contends for the only slot
+
+	act.mu.Lock()
+	closed := append([]string(nil), act.closed...)
+	act.mu.Unlock()
+	if len(closed) != 1 || closed[0] != "fresh" {
+		t.Fatalf("idle bot must release its hot socket under pressure, closed=%v", closed)
+	}
+}
+
+// Idle decay must be PRESSURE-DRIVEN, not absolute: with spare hot budget an
+// idle bot keeps its socket. (2026-06-06: a single registered bot was demoted
+// every HotIdle=2m, closing a perfectly healthy socket — "works once then
+// dies" from the worker's own tier manager; warm REST polling can't cover a
+// bot whose channel list is still empty.)
+func TestSpareHotCapacityKeepsIdleBotsHot(t *testing.T) {
+	act := &fakeAct{}
+	now := time.Unix(1000, 0)
+	m := tier.New(tier.Config{
+		MaxHot: 5, HotIdle: time.Minute, WarmIdle: 5 * time.Minute,
+		Now: func() time.Time { return now },
+	}, act)
+	m.Add(bot("solo", "t1", "pro"))
+	m.Rebalance()
+
+	// way past HotIdle AND WarmIdle — budget is empty, so it must stay hot
+	now = now.Add(30 * time.Minute)
+	m.Rebalance()
+
+	act.mu.Lock()
+	closed := append([]string(nil), act.closed...)
+	act.mu.Unlock()
+	if len(closed) != 0 {
+		t.Fatalf("idle bot with spare hot capacity must keep its socket, closed=%v", closed)
+	}
+	if m.TierOf("solo") != types.Hot {
+		t.Fatalf("tier = %s, want hot", m.TierOf("solo"))
+	}
+}
+
+// Under contention the activity-based decay still applies: the active bot
+// keeps the only slot, the idle one demotes.
+func TestIdleDecayUnderPressure(t *testing.T) {
+	act := &fakeAct{}
+	now := time.Unix(1000, 0)
+	m := tier.New(tier.Config{
+		MaxHot: 1, HotIdle: time.Minute, WarmIdle: 5 * time.Minute,
+		Now: func() time.Time { return now },
+	}, act)
+	m.Add(bot("idle", "t1", "pro"))
+	m.Rebalance() // idle takes the slot first
+
+	now = now.Add(2 * time.Minute) // idle past HotIdle
+	m.Add(bot("active", "t2", "pro"))
+	m.Touch("active")
+
+	if m.TierOf("active") != types.Hot {
+		t.Fatalf("active bot must win the contended slot, got %s", m.TierOf("active"))
+	}
+	if m.TierOf("idle") == types.Hot {
+		t.Fatal("idle bot must yield the slot under pressure")
 	}
 }

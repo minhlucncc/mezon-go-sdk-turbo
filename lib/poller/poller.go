@@ -64,7 +64,10 @@ func (p *Poller) PollOnce(ctx context.Context, bot types.BotRef, token string) (
 		if err := p.limiter.Wait(ctx); err != nil {
 			return found, err
 		}
-		cursor, _ := p.store.Cursor(ctx, bot.KeyID, ch)
+		cursor, err := p.store.Cursor(ctx, bot.KeyID, ch)
+		if err != nil {
+			return found, err
+		}
 		msgs, newCursor, err := p.lister.ListSince(ctx, token, ch, "", cursor, p.pageLimit)
 		if err != nil {
 			continue // transient; try again next poll
@@ -73,23 +76,35 @@ func (p *Poller) PollOnce(ctx context.Context, bot types.BotRef, token string) (
 			if m.SenderID == bot.BotUserID {
 				continue
 			}
-			seen, _ := p.store.Seen(ctx, bot.KeyID, m.MessageID)
+			seen, err := p.store.Seen(ctx, bot.KeyID, m.MessageID)
+			if err != nil {
+				return found, err
+			}
 			if seen {
 				continue
 			}
 			found++
 			if p.onMessage != nil {
-				p.onMessage(bot, m)
+				p.emit(bot, m)
 			}
 		}
 		if newCursor != "" && newCursor != cursor {
-			_ = p.store.SetCursor(ctx, bot.KeyID, ch, newCursor)
+			if err := p.store.SetCursor(ctx, bot.KeyID, ch, newCursor); err != nil {
+				return found, err
+			}
 		}
 	}
 	if found > 0 {
 		_ = p.store.BumpActivity(ctx, bot.KeyID, time.Now())
 	}
 	return found, nil
+}
+
+func (p *Poller) emit(bot types.BotRef, msg types.Message) {
+	defer func() { _ = recover() }()
+	if p.onMessage != nil {
+		p.onMessage(bot, msg)
+	}
 }
 
 // Submit runs PollOnce on a bounded worker; done (may be nil) is called with the

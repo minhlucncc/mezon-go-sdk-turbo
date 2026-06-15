@@ -7,10 +7,10 @@ import (
 	"strings"
 )
 
-// Mezon renders URLs as clickable only when the content blob carries "lk"
-// entities — UTF-16 (start, end) spans into the "t" text marking each bare
-// URL. Markdown links [name](url) are NOT rendered by Mezon clients; senders
-// must flatten them to bare-URL text before calling SendText.
+// Mezon renders URLs as clickable when the content blob carries "mk" entities
+// with type "lk" over the URL text. Markdown links [name](url) are NOT
+// rendered by Mezon clients; senders must flatten them to bare-URL text before
+// calling SendText.
 var urlRE = regexp.MustCompile(`https?://[^\s<>\[\]()]+`)
 
 const urlTrailingPunct = ".,;:!?"
@@ -35,20 +35,21 @@ var (
 )
 
 // BuildContent wraps text in Mezon's content blob: {"t": ...} plus "mk"
-// markdown entities (bold/code — clients render rich text from entity spans,
-// not markdown syntax; ** markers are stripped here while backtick spans keep
-// their backticks for the client to strip) and "lk" link entities for every
-// bare URL. Link spans are computed on the CLEANED text since marker
-// stripping shifts offsets.
+// entities (bold/code/link). Clients render rich text from entity spans, not
+// markdown syntax; ** markers are stripped here while backtick spans keep their
+// backticks for the client to strip. Link spans are computed on the CLEANED
+// text since marker stripping shifts offsets.
 func BuildContent(text string) string {
 	clean, marks := markdownSpans(text)
 	links := linkSpans(clean)
 	out := map[string]any{"t": clean}
+	if len(links) > 0 {
+		for _, link := range links {
+			marks = append(marks, markSpan{S: link.S, E: link.E, Type: "lk"})
+		}
+	}
 	if len(marks) > 0 {
 		out["mk"] = marks
-	}
-	if len(links) > 0 {
-		out["lk"] = links
 	}
 	blob, _ := json.Marshal(out)
 	return string(blob)

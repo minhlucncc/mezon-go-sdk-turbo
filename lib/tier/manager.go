@@ -6,6 +6,7 @@ package tier
 
 import (
 	"container/heap"
+	"sort"
 	"context"
 	"runtime"
 	"sync"
@@ -101,11 +102,18 @@ func New(cfg Config, act Actuator) *Manager {
 	return &Manager{cfg: cfg, act: act, bots: make(map[string]*entry)}
 }
 
-// Add registers a bot (starts Cold). Idempotent.
+// Add registers a bot. Idempotent. The bot starts with FRESH activity so the
+// next rebalance promotes it toward Hot (budget permitting): a new bot has no
+// known channels, so warm/cold REST polling is a no-op for it — without an
+// initial socket it could never see its first message and would sit Cold
+// forever (cold-start deadlock). If it stays idle it decays to Warm/Cold
+// through the normal windows.
 func (m *Manager) Add(bot types.BotRef) {
 	m.mu.Lock()
 	if _, ok := m.bots[bot.KeyID]; !ok {
-		m.bots[bot.KeyID] = &entry{bot: bot, tier: types.Cold, nextPoll: m.cfg.Now()}
+		m.bots[bot.KeyID] = &entry{
+			bot: bot, tier: types.Cold, nextPoll: m.cfg.Now(), lastActivity: m.cfg.Now(),
+		}
 	}
 	m.mu.Unlock()
 }
@@ -235,6 +243,32 @@ func (m *Manager) rebalanceLocked(now time.Time) []action {
 		}
 		selected[e.bot.KeyID] = true
 		perTenant[e.bot.TenantID]++
+	}
+
+	// 3b. Spare-capacity fill: idle decay is PRESSURE-driven, not absolute.
+	// With hot budget left over, idle bots keep (or get) sockets — closing a
+	// healthy socket saves nothing and makes fresh bots (empty channel list,
+	// so warm polling covers nothing) deaf on an Idle-period cycle. Highest
+	// score first, same fairness cap.
+	if len(selected) < effHot {
+		spare := make([]*entry, 0, len(m.bots))
+		for _, e := range m.bots {
+			if !selected[e.bot.KeyID] {
+				spare = append(spare, e)
+			}
+		}
+		sort.Slice(spare, func(i, j int) bool { return spare[i].score > spare[j].score })
+		for _, e := range spare {
+			if len(selected) >= effHot {
+				break
+			}
+			if m.cfg.HotPerTenant > 0 && perTenant[e.bot.TenantID] >= m.cfg.HotPerTenant {
+				continue
+			}
+			selected[e.bot.KeyID] = true
+			perTenant[e.bot.TenantID]++
+			want[e.bot.KeyID] = types.Hot
+		}
 	}
 
 	// 4. Reconcile each bot's actual tier with the decision.
