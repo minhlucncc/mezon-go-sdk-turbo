@@ -1,0 +1,22 @@
+# Binaries / build output
+*.exe
+*.dll
+*.so
+*.dylib
+/bin/
+/out/
+
+# Test & coverage
+*.test
+*.out
+cover.out
+coverage.txt
+
+# Go workspace (kept out of the module repo)
+go.work
+go.work.sum
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
