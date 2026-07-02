@@ -24,6 +24,7 @@ const (
 	envError              = 12
 	envPing               = 22
 	envTyping             = 24
+	envMessageReactionEvent = 26
 )
 
 // Mention is one mention entity span over the FINAL text (UTF-16 units).
@@ -146,6 +147,58 @@ func BuildTypingEnvelope(channelID, clanID, senderID string, mode int32, isPubli
 		msg = appendVarintField(msg, 5, 1)
 	}
 	return appendMessageField(nil, envTyping, msg)
+}
+
+// BuildReactionEnvelope assembles a MessageReactionEvent envelope (field 26)
+// for adding a reaction to a message.  emojiID is the numeric ID for a custom
+// clan emoji (empty for Unicode emojis).  emoji is either a Unicode glyph or a
+// custom shortcode (e.g. "pepe_joy").  Action true = add, false = remove.
+//
+// Live MessageReaction: 1 id str, 2 emoji_id i64, 3 emoji str, 4 sender_id i64,
+// 5 sender_name str, 6 sender_avatar str, 7 action bool, 8 count i32,
+// 9 channel_id i64, 10 message_id i64, 11 clan_id i64, 12 mode i32,
+// 13 message_sender_id i64, 14 is_public bool.
+func BuildReactionEnvelope(clanID, channelID, messageID, emojiID, emoji string, action bool, mode int32, isPublic bool) []byte {
+	var msg []byte
+	if emojiID != "" {
+		msg = appendVarintField(msg, 2, id(emojiID))
+	}
+	msg = appendStringField(msg, 3, emoji)
+	if action {
+		msg = appendVarintField(msg, 7, 1) // action=true
+	}
+	msg = appendVarintField(msg, 9, id(channelID))
+	msg = appendVarintField(msg, 10, id(messageID))
+	msg = appendVarintField(msg, 11, id(clanID))
+	msg = appendVarintField(msg, 12, uint64(uint32(mode)))
+	if isPublic {
+		msg = appendVarintField(msg, 14, 1)
+	}
+	return appendMessageField(nil, envMessageReactionEvent, msg)
+}
+
+// BuildStickerEnvelope assembles a ChannelMessageSend envelope (field 8) with
+// an ATTACHMENT carrying the sticker image URL and shortname.  Stickers are
+// sent as messages with a single MessageAttachment whose Filetype is "sticker".
+//
+// The attachment layout mirrors what the live server expects for sticker sends:
+// 1 filename (shortcode), 3 url (sticker CDN src), 4 filetype ("sticker").
+func BuildStickerEnvelope(channelID, clanID string, mode int32, isPublic bool, stickerShortcode, stickerURL string) []byte {
+	// Build a single MessageAttachment.
+	var att []byte
+	att = appendStringField(att, 1, stickerShortcode)
+	att = appendStringField(att, 3, stickerURL)
+	att = appendStringField(att, 4, "sticker")
+
+	var msg []byte
+	msg = appendVarintField(msg, 1, id(clanID))
+	msg = appendVarintField(msg, 2, id(channelID))
+	msg = appendMessageField(msg, 5, att) // attachments field
+	msg = appendVarintField(msg, 7, uint64(uint32(mode)))
+	if isPublic {
+		msg = appendVarintField(msg, 11, 1)
+	}
+	return appendMessageField(nil, envChannelMessageSend, msg)
 }
 
 // BuildPingEnvelope assembles a keepalive ping (empty Ping message, field 22).
