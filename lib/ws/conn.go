@@ -132,6 +132,21 @@ func (c *Conn) SendTyping(channelID, clanID, senderID string, mode int32, isPubl
 	return c.send(BuildTypingEnvelope(channelID, clanID, senderID, mode, isPublic))
 }
 
+// SendReaction adds (or removes) an emoji reaction on a message.
+// emoji is a Unicode glyph or a custom shortcode (e.g. "pepe_joy").
+// emojiID is the numeric ID for custom clan emojis (empty for Unicode).
+// action=true adds the reaction; action=false removes it.
+func (c *Conn) SendReaction(clanID, channelID, messageID, emojiID, emoji string, action bool, mode int32, isPublic bool) error {
+	return c.send(BuildReactionEnvelope(clanID, channelID, messageID, emojiID, emoji, action, mode, isPublic))
+}
+
+// SendSticker sends a sticker as a message with an attachment.
+// stickerShortcode is the sticker's shortcode (e.g. "froge_no").
+// stickerURL is the CDN URL for the sticker image.
+func (c *Conn) SendSticker(channelID, clanID string, mode int32, isPublic bool, stickerShortcode, stickerURL string) error {
+	return c.send(BuildStickerEnvelope(channelID, clanID, mode, isPublic, stickerShortcode, stickerURL))
+}
+
 // ping sends a keepalive (called by the PingWheel). Pings carry an
 // incrementing cid — the live server reaps sockets with cid-less pings.
 func (c *Conn) ping() error {

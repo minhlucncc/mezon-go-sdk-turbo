@@ -353,3 +353,42 @@ func (e *Engine) SendTyping(bot types.BotRef, in types.Message) {
 		_ = conn.SendTyping(in.ChannelID, in.ClanID, bot.BotUserID, in.Mode, in.IsPublic)
 	}
 }
+
+// SendReaction adds (or removes) an emoji reaction on a message. emoji is a
+// Unicode glyph or a custom shortcode (e.g. "pepe_joy"). emojiID is the numeric
+// ID for custom clan emojis (empty for Unicode). action=true adds, false removes.
+func (e *Engine) SendReaction(bot types.BotRef, in types.Message, emojiID, emoji string, action bool) error {
+	e.mu.Lock()
+	conn := e.hot[bot.KeyID]
+	e.mu.Unlock()
+	if conn != nil && !conn.Closed() {
+		return conn.SendReaction(in.ClanID, in.ChannelID, in.MessageID, emojiID, emoji, action, in.Mode, in.IsPublic)
+	}
+	// Fallback: transient socket.
+	token, wsHost, clanIDs := e.session(bot)
+	tmp, err := ws.Dial(wsHost, e.cfg.WSSSL, token, bot.BotUserID, clanIDs, func(types.Message) {}, nil)
+	if err != nil {
+		return err
+	}
+	defer tmp.Close()
+	return tmp.SendReaction(in.ClanID, in.ChannelID, in.MessageID, emojiID, emoji, action, in.Mode, in.IsPublic)
+}
+
+// SendSticker sends a sticker as a message attachment. stickerShortcode is the
+// sticker's shortcode (e.g. "froge_no"). stickerURL is the CDN image URL.
+func (e *Engine) SendSticker(bot types.BotRef, in types.Message, stickerShortcode, stickerURL string) error {
+	e.mu.Lock()
+	conn := e.hot[bot.KeyID]
+	e.mu.Unlock()
+	if conn != nil && !conn.Closed() {
+		return conn.SendSticker(in.ChannelID, in.ClanID, in.Mode, in.IsPublic, stickerShortcode, stickerURL)
+	}
+	// Fallback: transient socket.
+	token, wsHost, clanIDs := e.session(bot)
+	tmp, err := ws.Dial(wsHost, e.cfg.WSSSL, token, bot.BotUserID, clanIDs, func(types.Message) {}, nil)
+	if err != nil {
+		return err
+	}
+	defer tmp.Close()
+	return tmp.SendSticker(in.ChannelID, in.ClanID, in.Mode, in.IsPublic, stickerShortcode, stickerURL)
+}
