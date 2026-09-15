@@ -225,13 +225,16 @@ func TestBuildClanJoinEnvelope(t *testing.T) {
 }
 
 func TestBuildTypingEnvelope(t *testing.T) {
-	env := ws.BuildTypingEnvelope("22", "11", "33", 2, true)
-	var got struct{ clan, chan_, sender, mode, public uint64 }
+	env := ws.BuildTypingEnvelope("22", "11", "33", "meknow", "MeKnow Bot", 2, true)
+	var got struct {
+		clan, chan_, sender, mode, public uint64
+		username, displayName             string
+	}
 	walk(t, env, func(num protowire.Number, typ protowire.Type, v []byte, _ uint64) {
 		if num != 24 || typ != protowire.BytesType { // Envelope.message_typing_event
 			t.Fatalf("unexpected envelope field %d", num)
 		}
-		walk(t, v, func(num protowire.Number, _ protowire.Type, _ []byte, u uint64) {
+		walk(t, v, func(num protowire.Number, _ protowire.Type, b []byte, u uint64) {
 			switch num {
 			case 1:
 				got.clan = u
@@ -243,11 +246,37 @@ func TestBuildTypingEnvelope(t *testing.T) {
 				got.mode = u
 			case 5:
 				got.public = u
+			case 6:
+				got.username = string(b)
+			case 7:
+				got.displayName = string(b)
 			}
 		})
 	})
 	if got.clan != 11 || got.chan_ != 22 || got.sender != 33 || got.mode != 2 || got.public != 1 {
 		t.Fatalf("typing event wrong: %+v", got)
+	}
+	// Clients render "<sender_display_name || sender_username> is typing" and
+	// fall back to the raw sender id when both are empty (mezon web ChatContext).
+	if got.username != "meknow" || got.displayName != "MeKnow Bot" {
+		t.Fatalf("typing sender name wrong: %+v", got)
+	}
+}
+
+// A bot with no display name still shows a name: display name falls back to
+// the username (mezon-ios writeMessageTyping parity).
+func TestBuildTypingEnvelopeDisplayNameFallsBackToUsername(t *testing.T) {
+	env := ws.BuildTypingEnvelope("22", "11", "33", "meknow", "", 2, true)
+	var displayName string
+	walk(t, env, func(_ protowire.Number, _ protowire.Type, v []byte, _ uint64) {
+		walk(t, v, func(num protowire.Number, _ protowire.Type, b []byte, _ uint64) {
+			if num == 7 {
+				displayName = string(b)
+			}
+		})
+	})
+	if displayName != "meknow" {
+		t.Fatalf("display name = %q, want username fallback", displayName)
 	}
 }
 

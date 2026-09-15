@@ -136,8 +136,17 @@ func BuildClanJoinEnvelope(clanID string) []byte {
 }
 
 // BuildTypingEnvelope assembles a MessageTypingEvent envelope.
-// Live: 1 clan_id i64, 2 channel_id i64, 3 sender_id i64, 4 mode i32, 5 is_public bool.
-func BuildTypingEnvelope(channelID, clanID, senderID string, mode int32, isPublic bool) []byte {
+// Live: 1 clan_id i64, 2 channel_id i64, 3 sender_id i64, 4 mode i32,
+// 5 is_public bool, 6 sender_username str, 7 sender_display_name str.
+//
+// The server relays the names verbatim: clients render
+// "<sender_display_name || sender_username> is typing" and show the raw sender
+// id when both are blank. Official clients (mezon web/Android/iOS) always fill
+// them; an empty displayName falls back to the username (mezon-ios parity).
+func BuildTypingEnvelope(channelID, clanID, senderID, senderUsername, senderDisplayName string, mode int32, isPublic bool) []byte {
+	if senderDisplayName == "" {
+		senderDisplayName = senderUsername
+	}
 	var msg []byte
 	msg = appendVarintField(msg, 1, id(clanID))
 	msg = appendVarintField(msg, 2, id(channelID))
@@ -146,6 +155,8 @@ func BuildTypingEnvelope(channelID, clanID, senderID string, mode int32, isPubli
 	if isPublic {
 		msg = appendVarintField(msg, 5, 1)
 	}
+	msg = appendStringField(msg, 6, senderUsername)
+	msg = appendStringField(msg, 7, senderDisplayName)
 	return appendMessageField(nil, envTyping, msg)
 }
 

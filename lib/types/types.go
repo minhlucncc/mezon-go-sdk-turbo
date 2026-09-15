@@ -45,6 +45,10 @@ type BotRef struct {
 	WorkspaceID  string
 	BotVersionID string
 	Plan         string // tenant plan: starter | pro | enterprise (priority weight)
+	// Optional bot name shown on the typing indicator. When empty the engine
+	// resolves it from the bot's Mezon account (GetAccount).
+	BotUsername    string
+	BotDisplayName string
 	// Per-channel answer triggers (portal channel settings); empty → the
 	// consumer's default gate applies.
 	ChannelTriggers []ChannelTrigger
