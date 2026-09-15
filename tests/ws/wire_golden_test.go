@@ -123,7 +123,7 @@ func TestGoldenOutboundEncode(t *testing.T) {
 			case "clan_join":
 				got = ws.BuildClanJoinEnvelope(c.ClanID)
 			case "typing":
-				got = ws.BuildTypingEnvelope(c.ChannelID, c.ClanID, c.SenderID, c.Mode, c.IsPublic)
+				got = ws.BuildTypingEnvelope(c.ChannelID, c.ClanID, c.SenderID, "", "", c.Mode, c.IsPublic)
 			case "send":
 				opts := ws.SendOpts{MentionEveryone: c.MentionEveryone}
 				if c.Mention != nil {

@@ -188,3 +188,49 @@ func TestListClanIDsGolden(t *testing.T) {
 		}
 	}
 }
+
+// The typing indicator needs the bot's own name, which the session does not
+// carry. POST /mezon.api.Mezon/GetAccount (session Bearer, empty request)
+// returns the live Account wire: 1 user { 1 id i64, 2 username, 3 display_name }.
+func TestGetAccount(t *testing.T) {
+	user := protowire.AppendVarint(protowire.AppendTag(nil, 1, protowire.VarintType), 2062754877070643200)
+	user = protowire.AppendString(protowire.AppendTag(user, 2, protowire.BytesType), "meknow")
+	user = protowire.AppendString(protowire.AppendTag(user, 3, protowire.BytesType), "MeKnow Bot")
+	user = protowire.AppendString(protowire.AppendTag(user, 4, protowire.BytesType), "https://cdn/avatar.png")
+	resp := protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), user)
+	resp = protowire.AppendString(protowire.AppendTag(resp, 2, protowire.BytesType), "bot@example.com")
+
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/mezon.api.Mezon/GetAccount" || r.Method != "POST" {
+			http.NotFound(w, r)
+			return
+		}
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/proto")
+		_, _ = w.Write(resp)
+	}))
+	defer srv.Close()
+
+	c := rest.New("http://unused.invalid")
+	acc, err := c.GetAccount(t.Context(), srv.URL, "session-jwt")
+	if err != nil {
+		t.Fatalf("get account: %v", err)
+	}
+	if gotAuth != "Bearer session-jwt" {
+		t.Fatalf("Authorization = %q", gotAuth)
+	}
+	if acc.UserID != "2062754877070643200" || acc.Username != "meknow" || acc.DisplayName != "MeKnow Bot" {
+		t.Fatalf("account mismatch: %+v", acc)
+	}
+}
+
+func TestGetAccountSurfacesHTTPErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+	if _, err := rest.New(srv.URL).GetAccount(t.Context(), srv.URL, "bad"); err == nil {
+		t.Fatal("expected error for 401")
+	}
+}

@@ -127,9 +127,10 @@ func (c *Conn) SendTextOpts(channelID, clanID string, mode int32, isPublic bool,
 	return c.send(BuildSendEnvelope(channelID, clanID, mode, isPublic, text, opts))
 }
 
-// SendTyping emits a typing indicator.
-func (c *Conn) SendTyping(channelID, clanID, senderID string, mode int32, isPublic bool) error {
-	return c.send(BuildTypingEnvelope(channelID, clanID, senderID, mode, isPublic))
+// SendTyping emits a typing indicator. senderUsername/senderDisplayName are
+// what clients show ("<name> is typing"); blank names make them show the id.
+func (c *Conn) SendTyping(channelID, clanID, senderID, senderUsername, senderDisplayName string, mode int32, isPublic bool) error {
+	return c.send(BuildTypingEnvelope(channelID, clanID, senderID, senderUsername, senderDisplayName, mode, isPublic))
 }
 
 // SendReaction adds (or removes) an emoji reaction on a message.

@@ -49,6 +49,13 @@ type ClanLister interface {
 	ListClanIDs(ctx context.Context, baseURL, sessionToken string) ([]string, error)
 }
 
+// AccountFetcher fetches the bot's own account (rest.Client satisfies it). The
+// session carries only the user id, but the typing indicator must carry the
+// bot's username/display name or clients render the raw id.
+type AccountFetcher interface {
+	GetAccount(ctx context.Context, baseURL, sessionToken string) (rest.Account, error)
+}
+
 // sessionTTL bounds how long an exchanged session token is reused before
 // re-authenticating. Dial failures also drop the cached session immediately.
 const sessionTTL = 30 * time.Minute
@@ -57,7 +64,10 @@ type cachedSession struct {
 	token   string
 	wsHost  string   // session-provided socket host (e.g. sock.mezon.ai)
 	clanIDs []string // joined clans + "0" (DM space) — ClanJoin targets
-	fetched time.Time
+	// bot's own account names (typing indicator); empty if the lookup failed
+	username    string
+	displayName string
+	fetched     time.Time
 }
 
 // Engine is the resource-aware Mezon client.
@@ -68,8 +78,9 @@ type Engine struct {
 	mgr       *tier.Manager
 	pw        *ws.PingWheel
 	onMessage func(types.BotRef, types.Message)
-	auth      Authenticator // nil → raw tokens (tests/legacy)
-	clans     ClanLister    // nil → dial joins no clans
+	auth      Authenticator  // nil → raw tokens (tests/legacy)
+	clans     ClanLister     // nil → dial joins no clans
+	accounts  AccountFetcher // nil → typing carries only names set on BotRef
 
 	mu       sync.Mutex
 	hot      map[string]*ws.Conn
@@ -97,6 +108,9 @@ func New(cfg Config, rdb redis.Cmdable, lister poller.Lister, onMessage func(typ
 	}
 	if cl, ok := lister.(ClanLister); ok {
 		e.clans = cl
+	}
+	if af, ok := lister.(AccountFetcher); ok {
+		e.accounts = af
 	}
 	e.poller = poller.New(lister, e.store, e.onPollMessage, cfg.PollRPS, cfg.PollWorkers, cfg.PollPageLimit)
 	e.mgr = tier.New(cfg.Tier, e) // Engine implements tier.Actuator
@@ -141,8 +155,17 @@ func (e *Engine) session(bot types.BotRef) (token, wsHost string, clanIDs []stri
 			clanIDs = append(clanIDs, ids...)
 		}
 	}
+	cs := cachedSession{token: sess.Token, wsHost: wsHost, clanIDs: clanIDs, fetched: time.Now()}
+	if e.accounts != nil {
+		acc, err := e.accounts.GetAccount(ctx, sess.APIURL, sess.Token)
+		if err != nil {
+			log.Printf("get account failed (bot=%s key=%s): %v — typing will show the bot id", bot.BotUserID, bot.KeyID, err)
+		} else {
+			cs.username, cs.displayName = acc.Username, acc.DisplayName
+		}
+	}
 	e.mu.Lock()
-	e.sessions[bot.KeyID] = cachedSession{token: sess.Token, wsHost: wsHost, clanIDs: clanIDs, fetched: time.Now()}
+	e.sessions[bot.KeyID] = cs
 	e.mu.Unlock()
 	return sess.Token, wsHost, clanIDs
 }
@@ -345,13 +368,24 @@ func (e *Engine) SendTo(bot types.BotRef, channelID, clanID string, mode int32, 
 }
 
 // SendTyping emits a typing indicator if the bot is hot (no-op otherwise).
+// The indicator carries the bot's name — BotRef's when set, else the account
+// names cached with the session (a hot bot always has one: OpenHot resolved it).
 func (e *Engine) SendTyping(bot types.BotRef, in types.Message) {
 	e.mu.Lock()
 	conn := e.hot[bot.KeyID]
+	s := e.sessions[bot.KeyID]
 	e.mu.Unlock()
-	if conn != nil && !conn.Closed() {
-		_ = conn.SendTyping(in.ChannelID, in.ClanID, bot.BotUserID, in.Mode, in.IsPublic)
+	if conn == nil || conn.Closed() {
+		return
 	}
+	username, displayName := bot.BotUsername, bot.BotDisplayName
+	if username == "" {
+		username = s.username
+	}
+	if displayName == "" {
+		displayName = s.displayName
+	}
+	_ = conn.SendTyping(in.ChannelID, in.ClanID, bot.BotUserID, username, displayName, in.Mode, in.IsPublic)
 }
 
 // SendReaction adds (or removes) an emoji reaction on a message. emoji is a

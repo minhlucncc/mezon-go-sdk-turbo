@@ -55,12 +55,18 @@ type fakeMezon struct {
 	replies   [][]byte
 	replyCh   chan []byte
 	conn      *websocket.Conn
+
+	// GetAccount identity; typingCh (when set) receives typing envelopes.
+	username    string
+	displayName string
+	typingCh    chan []byte
 }
 
 func (f *fakeMezon) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v2/apps/authenticate/token", f.handleAuth)
 	mux.HandleFunc("/mezon.api.Mezon/ListClanDescs", f.handleClans)
+	mux.HandleFunc("/mezon.api.Mezon/GetAccount", f.handleAccount)
 	mux.HandleFunc("/ws", f.handleWS)
 	return mux
 }
@@ -106,6 +112,22 @@ func (f *fakeMezon) handleClans(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(resp)
 }
 
+// handleAccount serves the live Account wire: 1 user { 1 id i64, 2 username,
+// 3 display_name }.
+func (f *fakeMezon) handleAccount(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Authorization") != "Bearer "+f.session {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	id, _ := protowireParseUint(f.appID)
+	user := protowire.AppendVarint(protowire.AppendTag(nil, 1, protowire.VarintType), id)
+	user = protowire.AppendString(protowire.AppendTag(user, 2, protowire.BytesType), f.username)
+	user = protowire.AppendString(protowire.AppendTag(user, 3, protowire.BytesType), f.displayName)
+	resp := protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), user)
+	w.Header().Set("Content-Type", "application/proto")
+	_, _ = w.Write(resp)
+}
+
 func (f *fakeMezon) handleWS(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.wsToken = r.URL.Query().Get("token")
@@ -132,6 +154,10 @@ func (f *fakeMezon) handleWS(w http.ResponseWriter, r *http.Request) {
 				f.mu.Lock()
 				f.joins = append(f.joins, id)
 				f.mu.Unlock()
+				continue
+			}
+			if isTypingEnvelope(data) && f.typingCh != nil {
+				f.typingCh <- data
 				continue
 			}
 			if isSendEnvelope(data) {
@@ -179,6 +205,104 @@ func parseClanJoin(b []byte) (uint64, bool) {
 func isSendEnvelope(b []byte) bool {
 	num, typ, n := protowire.ConsumeTag(b)
 	return n > 0 && num == 8 && typ == protowire.BytesType // Envelope.channel_message_send
+}
+
+func isTypingEnvelope(b []byte) bool {
+	num, typ, n := protowire.ConsumeTag(b)
+	return n > 0 && num == 24 && typ == protowire.BytesType // Envelope.message_typing_event
+}
+
+// typingNames extracts MessageTypingEvent 6 sender_username / 7 sender_display_name.
+func typingNames(b []byte) (username, displayName string) {
+	_, _, n := protowire.ConsumeTag(b)
+	inner, _ := protowire.ConsumeBytes(b[n:])
+	for len(inner) > 0 {
+		num, typ, n := protowire.ConsumeTag(inner)
+		if n < 0 {
+			return
+		}
+		inner = inner[n:]
+		if typ == protowire.BytesType {
+			v, n := protowire.ConsumeBytes(inner)
+			if num == 6 {
+				username = string(v)
+			} else if num == 7 {
+				displayName = string(v)
+			}
+			inner = inner[n:]
+			continue
+		}
+		inner = inner[protowire.ConsumeFieldValue(num, typ, inner):]
+	}
+	return
+}
+
+// The typing indicator must carry the bot's NAME: Mezon clients render
+// "<sender_display_name || sender_username> is typing" and fall back to the
+// raw sender id when both are blank — the "bot id is typing" regression. The
+// engine resolves the name from GetAccount with the bot's session.
+func TestTypingIndicatorCarriesBotName(t *testing.T) {
+	fake := &fakeMezon{
+		t:           t,
+		apiKey:      "raw-api-key",
+		appID:       "2062754877070643200",
+		session:     "session-jwt-token",
+		clanID:      "1780431535405535232",
+		replyCh:     make(chan []byte, 4),
+		username:    "meknow",
+		displayName: "MeKnow Bot",
+		typingCh:    make(chan []byte, 4),
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	cfg := turbo.Config{
+		Tier:        tier.Config{MaxHot: 5, Tick: 20 * time.Millisecond},
+		PollRPS:     100,
+		PollWorkers: 2,
+		StateTTL:    time.Hour,
+		DedupCap:    128,
+	}
+	engine := turbo.New(cfg, rdb, rest.New(srv.URL), func(types.BotRef, types.Message) {})
+	ctx, cancel := testContext(t)
+	defer cancel()
+	go engine.Run(ctx)
+
+	bot := types.BotRef{KeyID: "k1", BotUserID: fake.appID, BotToken: fake.apiKey, TenantID: "t1"}
+	engine.Register(bot)
+	waitFor(t, 5*time.Second, "clan joins", func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return len(fake.joins) >= 2
+	})
+
+	in := types.Message{ChannelID: "1780431535405535233", ClanID: fake.clanID, Mode: 2, IsPublic: true}
+	engine.SendTyping(bot, in)
+	select {
+	case data := <-fake.typingCh:
+		if u, d := typingNames(data); u != "meknow" || d != "MeKnow Bot" {
+			t.Fatalf("typing names = (%q, %q), want (meknow, MeKnow Bot)", u, d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("typing envelope never reached the server")
+	}
+
+	// A consumer-supplied name wins over the account lookup.
+	named := bot
+	named.BotDisplayName = "Trợ lý FUNiX"
+	engine.SendTyping(named, in)
+	select {
+	case data := <-fake.typingCh:
+		if _, d := typingNames(data); d != "Trợ lý FUNiX" {
+			t.Fatalf("display name override ignored: %q", d)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("second typing envelope never reached the server")
+	}
 }
 
 func protowireParseUint(s string) (uint64, error) {
