@@ -52,6 +52,16 @@ type BotRef struct {
 	// Per-channel answer triggers (portal channel settings); empty → the
 	// consumer's default gate applies.
 	ChannelTriggers []ChannelTrigger
+	// CommandPrefixes are the message prefixes this bot's TASKS declare as
+	// their trigger (`*chambai`). A message starting with one is addressed to
+	// the bot by definition — it named a command the bot owns — so it passes
+	// the mention gate without an @mention.
+	//
+	// Derived from the tasks themselves, never configured separately: a task
+	// that says `*chambai` fires it, and a gate that had to be told the same
+	// thing again in the portal is a second place to look for what a bot
+	// answers, and the two would drift.
+	CommandPrefixes []string
 }
 
 // Message is the normalized inbound message, populated by either the WS partial
@@ -64,6 +74,11 @@ type Message struct {
 	SenderID     string
 	Content      string // raw Mezon content blob (JSON {"t": "..."} typically)
 	Mentions     string // raw mentions blob (JSON [{"user_id": ...}, ...])
+	// Attachments is the raw attachments blob, in the same REST JSON dialect
+	// as Mentions: `[{"filename":..,"url":..,"filetype":..,"size":N}]`.
+	// A student sending an essay as a file is an ordinary message with one of
+	// these on it, so dropping them at the wire would lose the submission.
+	Attachments  string
 	References   string // raw references blob (JSON [{"message_sender_id": ...}, ...])
 	Username     string
 	Avatar       string
