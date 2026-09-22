@@ -95,6 +95,8 @@ func decodeChannelMessageFields(b []byte) (types.Message, error) {
 				msg.ClanNick = v
 			case 16:
 				msg.Mentions = mentionsToJSON([]byte(v))
+			case 17:
+				msg.Attachments = attachmentsToJSON([]byte(v))
 			case 18:
 				msg.References = refsToJSON([]byte(v))
 			}
@@ -162,6 +164,44 @@ func mentionsToJSON(b []byte) string {
 			}
 		})
 		out = append(out, m)
+	})
+	if len(out) == 0 {
+		return ""
+	}
+	j, _ := json.Marshal(out)
+	return string(j)
+}
+
+// attachmentsToJSON converts MessageAttachmentList{1: repeated
+// MessageAttachment{1 filename str, 2 size i32, 3 url str, 4 filetype str}} to
+// the REST JSON dialect.
+//
+// Field numbers are taken from the official mezon-sdk's generated encoder
+// (`api.MessageAttachment.encode`), not inferred from captured traffic — a
+// guessed field number silently yields the wrong string rather than an error.
+func attachmentsToJSON(b []byte) string {
+	type attachment struct {
+		Filename string `json:"filename"`
+		URL      string `json:"url"`
+		Filetype string `json:"filetype"`
+		Size     int32  `json:"size"`
+	}
+	var out []attachment
+	walkWire(b, 1, func(item []byte) {
+		var a attachment
+		walkVarints(item, func(num protowire.Number, v uint64, sv []byte) {
+			switch num {
+			case 1:
+				a.Filename = string(sv)
+			case 2:
+				a.Size = int32(v)
+			case 3:
+				a.URL = string(sv)
+			case 4:
+				a.Filetype = string(sv)
+			}
+		})
+		out = append(out, a)
 	})
 	if len(out) == 0 {
 		return ""

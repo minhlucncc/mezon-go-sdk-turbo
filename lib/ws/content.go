@@ -98,6 +98,29 @@ func markdownSpans(text string) (string, []markSpan) {
 	}
 	sort.Slice(events, func(i, j int) bool { return events[i].s < events[j].s })
 
+	// Drop any event that starts before the previous one ended.
+	//
+	// The endpoint checks above skip a bold whose START or whose LAST CHAR
+	// sits inside a masked region — but not one that CONTAINS a masked region
+	// outright, which `**see `x` here**` does. Two overlapping events then
+	// walk `pos` past the next event's start, and `text[pos:ev.s]` panics with
+	// an inverted slice. That took the whole bridge down for every bot on it,
+	// because one bot's reply happened to contain backticks inside bold.
+	//
+	// The nested event is dropped rather than the outer one: the outer span
+	// still covers that text, so the client renders it — one entity instead of
+	// two, which is a rendering difference, where the alternative was a crash.
+	kept := events[:0]
+	end := -1
+	for _, ev := range events {
+		if ev.s < end {
+			continue
+		}
+		kept = append(kept, ev)
+		end = ev.e
+	}
+	events = kept
+
 	var b strings.Builder
 	var spans []markSpan
 	outU16, pos := 0, 0
