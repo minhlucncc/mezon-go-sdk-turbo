@@ -7,8 +7,10 @@ package turbo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +76,10 @@ type AccountFetcher interface {
 	GetAccount(ctx context.Context, baseURL, sessionToken string) (rest.Account, error)
 }
 
+// channelsBackoff is how long a bot whose channel listing was refused (403)
+// goes without asking again.
+const channelsBackoff = 6 * time.Hour
+
 // sessionTTL bounds how long an exchanged session token is reused before
 // re-authenticating. Dial failures also drop the cached session immediately.
 const sessionTTL = 30 * time.Minute
@@ -102,10 +108,13 @@ type Engine struct {
 	dir       ClanDirectory  // nil → SyncClans unsupported
 	accounts  AccountFetcher // nil → typing carries only names set on BotRef
 
-	mu       sync.Mutex
-	hot      map[string]*ws.Conn
-	opening  map[string]struct{}
-	sessions map[string]cachedSession // keyID → exchanged session
+	mu sync.Mutex
+	// noChannels holds bots whose token may not list channels (a 403) and when
+	// that was learned; SyncClans skips the listing for channelsBackoff.
+	noChannels map[string]time.Time
+	hot        map[string]*ws.Conn
+	opening    map[string]struct{}
+	sessions   map[string]cachedSession // keyID → exchanged session
 }
 
 // New builds an engine. lister is the REST capability (rest.New(apiBase)
@@ -115,13 +124,14 @@ type Engine struct {
 // tokens before any dial or poll.
 func New(cfg Config, rdb redis.Cmdable, lister poller.Lister, onMessage func(types.BotRef, types.Message)) *Engine {
 	e := &Engine{
-		cfg:       cfg,
-		store:     state.NewRedisStore(rdb, cfg.StateTTL, cfg.DedupCap),
-		pw:        ws.NewPingWheel(cfg.PingInterval),
-		onMessage: onMessage,
-		hot:       make(map[string]*ws.Conn),
-		opening:   make(map[string]struct{}),
-		sessions:  make(map[string]cachedSession),
+		cfg:        cfg,
+		store:      state.NewRedisStore(rdb, cfg.StateTTL, cfg.DedupCap),
+		pw:         ws.NewPingWheel(cfg.PingInterval),
+		onMessage:  onMessage,
+		hot:        make(map[string]*ws.Conn),
+		noChannels: make(map[string]time.Time),
+		opening:    make(map[string]struct{}),
+		sessions:   make(map[string]cachedSession),
 	}
 	if auth, ok := lister.(Authenticator); ok {
 		e.auth = auth
@@ -216,14 +226,32 @@ func (e *Engine) SyncClans(ctx context.Context, bot types.BotRef) ([]ClanSnapsho
 		return nil, fmt.Errorf("sync clans: %w", err)
 	}
 
+	e.mu.Lock()
+	forbiddenAt, forbidden := e.noChannels[bot.KeyID]
+	e.mu.Unlock()
+	listChannels := !forbidden || time.Since(forbiddenAt) > channelsBackoff
+
 	out := make([]ClanSnapshot, 0, len(clans))
 	for _, cl := range clans {
 		snap := ClanSnapshot{ID: cl.ID, Name: cl.Name}
-		chans, err := e.dir.ListChannels(ctx, s.apiURL, s.token, cl.ID)
-		if err != nil {
-			log.Printf("list channels failed (bot=%s clan=%s): %v", bot.BotUserID, cl.ID, err)
-		} else {
-			snap.Channels, snap.ChannelsKnown = chans, true
+		if listChannels {
+			chans, err := e.dir.ListChannels(ctx, s.apiURL, s.token, cl.ID)
+			var herr *rest.HTTPError
+			switch {
+			case err == nil:
+				snap.Channels, snap.ChannelsKnown = chans, true
+			case errors.As(err, &herr) && herr.Status == http.StatusForbidden:
+				// Live, bot tokens may not list channels at all. Stop asking —
+				// for every clan now and for a while — rather than log a 403
+				// per clan per pass; channels are then learned from messages.
+				log.Printf("channel listing not permitted (bot=%s) — channels will be learned from messages", bot.BotUserID)
+				e.mu.Lock()
+				e.noChannels[bot.KeyID] = time.Now()
+				e.mu.Unlock()
+				listChannels = false
+			default:
+				log.Printf("list channels failed (bot=%s clan=%s): %v", bot.BotUserID, cl.ID, err)
+			}
 		}
 		out = append(out, snap)
 	}
