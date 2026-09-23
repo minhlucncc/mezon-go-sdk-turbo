@@ -5,6 +5,7 @@
 package ws
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -48,7 +49,10 @@ type Conn struct {
 	onClose   func()
 	writeMu   sync.Mutex
 	closed    atomic.Bool
-	pingCid   atomic.Uint64 // keepalive request ids (server requires them)
+	pingCid   atomic.Uint64 // request ids: keepalives and acknowledged sends share one sequence
+
+	ackMu   sync.Mutex
+	pending map[uint64]chan Ack // cid'd requests waiting for the server's reply
 
 	joinMu sync.Mutex
 	joined map[string]bool // clans this socket has sent ClanJoin for
@@ -90,6 +94,12 @@ func (c *Conn) readLoop() {
 		_, data, err := c.ws.ReadMessage()
 		if err != nil {
 			return
+		}
+		if c.hasPending() {
+			if a, ok := DecodeAck(data); ok {
+				c.resolve(a)
+				continue
+			}
 		}
 		msg, ok, derr := DecodeChannelMessage(data)
 		if derr != nil || !ok {
@@ -152,6 +162,79 @@ func (c *Conn) SendText(channelID, clanID string, mode int32, isPublic bool, tex
 // mention_everyone) — used by scheduled-task outbound deliveries.
 func (c *Conn) SendTextOpts(channelID, clanID string, mode int32, isPublic bool, text string, opts SendOpts) error {
 	return c.send(BuildSendEnvelope(channelID, clanID, mode, isPublic, text, opts))
+}
+
+// ErrNoAck means the server did not answer a cid'd request in time. The frame
+// may still have been applied; callers treat it as "unconfirmed", not "failed".
+var ErrNoAck = errors.New("ws: no acknowledgement from server")
+
+// ErrRejected means the server answered a cid'd request with an Error.
+var ErrRejected = errors.New("ws: request rejected by server")
+
+// SendTextAck sends like SendTextOpts, then waits up to timeout for the
+// server's acknowledgement and returns the id it gave the new message.
+func (c *Conn) SendTextAck(channelID, clanID string, mode int32, isPublic bool, text string, opts SendOpts, timeout time.Duration) (string, error) {
+	a, err := c.request(BuildSendEnvelope(channelID, clanID, mode, isPublic, text, opts), timeout)
+	if err != nil {
+		return "", err
+	}
+	if a.MessageID == "" {
+		return "", ErrNoAck
+	}
+	return a.MessageID, nil
+}
+
+// UpdateText replaces the content of a message this bot sent, and waits up to
+// timeout for the server to confirm the edit.
+func (c *Conn) UpdateText(channelID, clanID, messageID string, mode int32, isPublic bool, text string, timeout time.Duration) error {
+	_, err := c.request(BuildUpdateEnvelope(channelID, clanID, messageID, mode, isPublic, text), timeout)
+	return err
+}
+
+func (c *Conn) request(env []byte, timeout time.Duration) (Ack, error) {
+	cid := c.pingCid.Add(1)
+	ch := make(chan Ack, 1)
+	c.ackMu.Lock()
+	if c.pending == nil {
+		c.pending = make(map[uint64]chan Ack)
+	}
+	c.pending[cid] = ch
+	c.ackMu.Unlock()
+	defer func() {
+		c.ackMu.Lock()
+		delete(c.pending, cid)
+		c.ackMu.Unlock()
+	}()
+	if err := c.send(WithCid(cid, env)); err != nil {
+		return Ack{}, err
+	}
+	select {
+	case a := <-ch:
+		if a.Err {
+			return a, ErrRejected
+		}
+		return a, nil
+	case <-time.After(timeout):
+		return Ack{}, ErrNoAck
+	}
+}
+
+func (c *Conn) hasPending() bool {
+	c.ackMu.Lock()
+	defer c.ackMu.Unlock()
+	return len(c.pending) > 0
+}
+
+func (c *Conn) resolve(a Ack) {
+	c.ackMu.Lock()
+	ch := c.pending[a.Cid]
+	c.ackMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- a:
+		default:
+		}
+	}
 }
 
 // SendTyping emits a typing indicator. senderUsername/senderDisplayName are

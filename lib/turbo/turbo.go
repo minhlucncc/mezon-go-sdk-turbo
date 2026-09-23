@@ -485,6 +485,60 @@ func (e *Engine) SendTo(bot types.BotRef, channelID, clanID string, mode int32, 
 	return tmp.SendTextOpts(channelID, clanID, mode, isPublic, text, opts)
 }
 
+// SendAck replies like Send and returns the id the server gave the new
+// message, so the caller can edit it later (a "working on it" placeholder
+// that becomes the answer). Waits up to timeout for the acknowledgement.
+func (e *Engine) SendAck(bot types.BotRef, in types.Message, text string, asReply bool, timeout time.Duration) (string, error) {
+	var ref *ws.Ref
+	if asReply && !in.IsDM() {
+		username := in.ClanNick
+		if username == "" {
+			username = in.DisplayName
+		}
+		if username == "" {
+			username = in.Username
+		}
+		ref = &ws.Ref{
+			RefMessageID: in.MessageID, SenderID: in.SenderID,
+			SenderUsername: username, SenderAvatar: in.Avatar, Content: in.Content,
+		}
+	}
+	var id string
+	err := e.withConn(bot, func(c *ws.Conn) error {
+		var err error
+		id, err = c.SendTextAck(in.ChannelID, in.ClanID, in.Mode, in.IsPublic, text, ws.SendOpts{Ref: ref}, timeout)
+		return err
+	})
+	return id, err
+}
+
+// UpdateTo replaces the content of a message the bot sent earlier and waits up
+// to timeout for the server to confirm. ws.ErrNoAck means unconfirmed.
+func (e *Engine) UpdateTo(bot types.BotRef, channelID, clanID, messageID string, mode int32, isPublic bool, text string, timeout time.Duration) error {
+	return e.withConn(bot, func(c *ws.Conn) error {
+		return c.UpdateText(channelID, clanID, messageID, mode, isPublic, text, timeout)
+	})
+}
+
+// withConn runs fn on the bot's hot socket, or on a transient one when the bot
+// is not hot — the same fallback SendTo uses. A transient socket stays open
+// until fn returns, so an acknowledgement it is waiting for can arrive.
+func (e *Engine) withConn(bot types.BotRef, fn func(*ws.Conn) error) error {
+	e.mu.Lock()
+	conn := e.hot[bot.KeyID]
+	e.mu.Unlock()
+	if conn != nil && !conn.Closed() {
+		return fn(conn)
+	}
+	token, wsHost, clanIDs := e.session(bot)
+	tmp, err := ws.Dial(wsHost, e.cfg.WSSSL, token, bot.BotUserID, clanIDs, func(types.Message) {}, nil)
+	if err != nil {
+		return err
+	}
+	defer tmp.Close()
+	return fn(tmp)
+}
+
 // SendTyping emits a typing indicator if the bot is hot (no-op otherwise).
 // The indicator carries the bot's name — BotRef's when set, else the account
 // names cached with the session (a hot bot always has one: OpenHot resolved it).
