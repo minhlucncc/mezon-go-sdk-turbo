@@ -113,6 +113,15 @@ func (c *Client) ListChannels(ctx context.Context, baseURL, sessionToken, clanID
 	return chans, nil
 }
 
+// HTTPError is a non-200 answer from a Mezon RPC; callers branch on Status
+// (a 403 means the token may never call it, not that it failed this time).
+type HTTPError struct {
+	Status int
+	Body   string
+}
+
+func (e *HTTPError) Error() string { return fmt.Sprintf("HTTP %d: %s", e.Status, e.Body) }
+
 // channelTypeText is CHANNEL_TYPE_CHANNEL.
 const channelTypeText = 1
 
@@ -137,7 +146,7 @@ func (c *Client) rpc(ctx context.Context, baseURL, sessionToken, method string, 
 	defer res.Body.Close()
 	payload, _ := io.ReadAll(io.LimitReader(res.Body, 4<<20))
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d: %s", res.StatusCode, payload)
+		return nil, &HTTPError{Status: res.StatusCode, Body: string(payload)}
 	}
 	return payload, nil
 }
