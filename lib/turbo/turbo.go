@@ -7,6 +7,7 @@ package turbo
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -49,6 +50,23 @@ type ClanLister interface {
 	ListClanIDs(ctx context.Context, baseURL, sessionToken string) ([]string, error)
 }
 
+// ClanDirectory lists a bot's clans with names, and a clan's text channels
+// (rest.Client satisfies it). It backs SyncClans.
+type ClanDirectory interface {
+	ListClans(ctx context.Context, baseURL, sessionToken string) ([]rest.Clan, error)
+	ListChannels(ctx context.Context, baseURL, sessionToken, clanID string) ([]rest.Channel, error)
+}
+
+// ClanSnapshot is one clan the bot has joined, with its text channels.
+// ChannelsKnown is false when the channel listing failed — Channels is then
+// empty for that reason, not because the clan has none.
+type ClanSnapshot struct {
+	ID            string
+	Name          string
+	Channels      []rest.Channel
+	ChannelsKnown bool
+}
+
 // AccountFetcher fetches the bot's own account (rest.Client satisfies it). The
 // session carries only the user id, but the typing indicator must carry the
 // bot's username/display name or clients render the raw id.
@@ -63,6 +81,7 @@ const sessionTTL = 30 * time.Minute
 type cachedSession struct {
 	token   string
 	wsHost  string   // session-provided socket host (e.g. sock.mezon.ai)
+	apiURL  string   // session-provided REST host
 	clanIDs []string // joined clans + "0" (DM space) — ClanJoin targets
 	// bot's own account names (typing indicator); empty if the lookup failed
 	username    string
@@ -80,6 +99,7 @@ type Engine struct {
 	onMessage func(types.BotRef, types.Message)
 	auth      Authenticator  // nil → raw tokens (tests/legacy)
 	clans     ClanLister     // nil → dial joins no clans
+	dir       ClanDirectory  // nil → SyncClans unsupported
 	accounts  AccountFetcher // nil → typing carries only names set on BotRef
 
 	mu       sync.Mutex
@@ -108,6 +128,9 @@ func New(cfg Config, rdb redis.Cmdable, lister poller.Lister, onMessage func(typ
 	}
 	if cl, ok := lister.(ClanLister); ok {
 		e.clans = cl
+	}
+	if d, ok := lister.(ClanDirectory); ok {
+		e.dir = d
 	}
 	if af, ok := lister.(AccountFetcher); ok {
 		e.accounts = af
@@ -155,7 +178,7 @@ func (e *Engine) session(bot types.BotRef) (token, wsHost string, clanIDs []stri
 			clanIDs = append(clanIDs, ids...)
 		}
 	}
-	cs := cachedSession{token: sess.Token, wsHost: wsHost, clanIDs: clanIDs, fetched: time.Now()}
+	cs := cachedSession{token: sess.Token, wsHost: wsHost, apiURL: sess.APIURL, clanIDs: clanIDs, fetched: time.Now()}
 	if e.accounts != nil {
 		acc, err := e.accounts.GetAccount(ctx, sess.APIURL, sess.Token)
 		if err != nil {
@@ -168,6 +191,73 @@ func (e *Engine) session(bot types.BotRef) (token, wsHost string, clanIDs []stri
 	e.sessions[bot.KeyID] = cs
 	e.mu.Unlock()
 	return sess.Token, wsHost, clanIDs
+}
+
+// SyncClans lists the clans the bot has joined, with each clan's text
+// channels, and joins any clan the live socket has not joined yet.
+//
+// The clan list is otherwise read once, at dial: a clan the bot is added to
+// while its socket is open delivers nothing until a redial — so it is never
+// answered in and never enrolled. Calling this periodically closes that gap;
+// the snapshot is what the consumer enrolls.
+func (e *Engine) SyncClans(ctx context.Context, bot types.BotRef) ([]ClanSnapshot, error) {
+	if e.dir == nil || e.auth == nil {
+		return nil, fmt.Errorf("sync clans: no clan directory configured")
+	}
+	e.session(bot) // ensure a cached session exists
+	e.mu.Lock()
+	s, ok := e.sessions[bot.KeyID]
+	e.mu.Unlock()
+	if !ok || s.apiURL == "" {
+		return nil, fmt.Errorf("sync clans: no session for bot %s", bot.BotUserID)
+	}
+	clans, err := e.dir.ListClans(ctx, s.apiURL, s.token)
+	if err != nil {
+		return nil, fmt.Errorf("sync clans: %w", err)
+	}
+
+	out := make([]ClanSnapshot, 0, len(clans))
+	for _, cl := range clans {
+		snap := ClanSnapshot{ID: cl.ID, Name: cl.Name}
+		chans, err := e.dir.ListChannels(ctx, s.apiURL, s.token, cl.ID)
+		if err != nil {
+			log.Printf("list channels failed (bot=%s clan=%s): %v", bot.BotUserID, cl.ID, err)
+		} else {
+			snap.Channels, snap.ChannelsKnown = chans, true
+		}
+		out = append(out, snap)
+	}
+
+	// Remember every clan so a redial inside the session TTL joins it, and
+	// join on the live socket whatever it has not joined yet.
+	e.mu.Lock()
+	if cur, ok := e.sessions[bot.KeyID]; ok {
+		known := make(map[string]bool, len(cur.clanIDs))
+		for _, id := range cur.clanIDs {
+			known[id] = true
+		}
+		for _, cl := range clans {
+			if !known[cl.ID] {
+				cur.clanIDs = append(cur.clanIDs, cl.ID)
+			}
+		}
+		e.sessions[bot.KeyID] = cur
+	}
+	conn := e.hot[bot.KeyID]
+	e.mu.Unlock()
+	if conn != nil && !conn.Closed() {
+		for _, cl := range clans {
+			if conn.HasJoined(cl.ID) {
+				continue
+			}
+			if err := conn.JoinClan(cl.ID); err != nil {
+				log.Printf("join clan failed (bot=%s clan=%s): %v", bot.BotUserID, cl.ID, err)
+			} else {
+				log.Printf("joined new clan (bot=%s clan=%s)", bot.BotUserID, cl.ID)
+			}
+		}
+	}
+	return out, nil
 }
 
 // dropSession forgets a bot's cached session (e.g. after a failed dial — the
