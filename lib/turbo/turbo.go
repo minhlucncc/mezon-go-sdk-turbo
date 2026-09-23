@@ -512,6 +512,20 @@ func (e *Engine) SendAck(bot types.BotRef, in types.Message, text string, asRepl
 	return id, err
 }
 
+// SendToAck posts to an explicit channel like SendTo, then waits up to timeout
+// for the server's acknowledgement and returns the new message's id. A delivery
+// that must not be counted until Mezon has it (outbound streams) uses this:
+// ws.ErrNoAck means unconfirmed, ws.ErrRejected means refused.
+func (e *Engine) SendToAck(bot types.BotRef, channelID, clanID string, mode int32, isPublic bool, text string, opts ws.SendOpts, timeout time.Duration) (string, error) {
+	var id string
+	err := e.withConn(bot, func(c *ws.Conn) error {
+		var err error
+		id, err = c.SendTextAck(channelID, clanID, mode, isPublic, text, opts, timeout)
+		return err
+	})
+	return id, err
+}
+
 // UpdateTo replaces the content of a message the bot sent earlier and waits up
 // to timeout for the server to confirm. ws.ErrNoAck means unconfirmed.
 func (e *Engine) UpdateTo(bot types.BotRef, channelID, clanID, messageID string, mode int32, isPublic bool, text string, timeout time.Duration) error {
