@@ -49,6 +49,9 @@ type Conn struct {
 	writeMu   sync.Mutex
 	closed    atomic.Bool
 	pingCid   atomic.Uint64 // keepalive request ids (server requires them)
+
+	joinMu sync.Mutex
+	joined map[string]bool // clans this socket has sent ClanJoin for
 }
 
 // Dial opens a lean WebSocket as a bot identity and starts the read loop. The
@@ -67,9 +70,10 @@ func Dial(host string, ssl bool, token, botUserID string, clanIDs []string, onMe
 	if err != nil {
 		return nil, err
 	}
-	c := &Conn{ws: raw, botUserID: botUserID, onMessage: onMessage, onClose: onClose}
+	c := &Conn{ws: raw, botUserID: botUserID, onMessage: onMessage, onClose: onClose,
+		joined: make(map[string]bool, len(clanIDs))}
 	for _, id := range clanIDs {
-		_ = c.send(BuildClanJoinEnvelope(id))
+		_ = c.JoinClan(id)
 	}
 	go c.readLoop()
 	return c, nil
@@ -112,6 +116,29 @@ func (c *Conn) send(env []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	return c.ws.WriteMessage(websocket.BinaryMessage, env)
+}
+
+// JoinClan subscribes the live socket to a clan the bot joined after dialing;
+// without it the socket stays silent for that clan until the next redial.
+// Joining a clan twice is a no-op.
+func (c *Conn) JoinClan(clanID string) error {
+	c.joinMu.Lock()
+	defer c.joinMu.Unlock()
+	if c.joined[clanID] {
+		return nil
+	}
+	if err := c.send(BuildClanJoinEnvelope(clanID)); err != nil {
+		return err
+	}
+	c.joined[clanID] = true
+	return nil
+}
+
+// HasJoined reports whether this socket has joined the clan.
+func (c *Conn) HasJoined(clanID string) bool {
+	c.joinMu.Lock()
+	defer c.joinMu.Unlock()
+	return c.joined[clanID]
 }
 
 // SendText sends a reply. content is plain text; it is wrapped in Mezon's

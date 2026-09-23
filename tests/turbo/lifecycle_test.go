@@ -60,12 +60,16 @@ type fakeMezon struct {
 	username    string
 	displayName string
 	typingCh    chan []byte
+
+	// extraClans are clans the bot "joined" after connecting (append under mu).
+	extraClans []string
 }
 
 func (f *fakeMezon) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v2/apps/authenticate/token", f.handleAuth)
 	mux.HandleFunc("/mezon.api.Mezon/ListClanDescs", f.handleClans)
+	mux.HandleFunc("/mezon.api.Mezon/ListChannelDescs", f.handleChannels)
 	mux.HandleFunc("/mezon.api.Mezon/GetAccount", f.handleAccount)
 	mux.HandleFunc("/ws", f.handleWS)
 	return mux
@@ -108,8 +112,30 @@ func (f *fakeMezon) handleClans(w http.ResponseWriter, r *http.Request) {
 	clan := protowire.AppendVarint(protowire.AppendTag(nil, 1, protowire.VarintType), 999000111)
 	clan = protowire.AppendVarint(protowire.AppendTag(clan, 5, protowire.VarintType), id)
 	resp := protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), clan)
+	f.mu.Lock()
+	extra := append([]string(nil), f.extraClans...)
+	f.mu.Unlock()
+	for _, c := range extra {
+		cid, _ := protowireParseUint(c)
+		d := protowire.AppendString(protowire.AppendTag(nil, 2, protowire.BytesType), "clan-"+c)
+		d = protowire.AppendVarint(protowire.AppendTag(d, 5, protowire.VarintType), cid)
+		resp = protowire.AppendBytes(protowire.AppendTag(resp, 1, protowire.BytesType), d)
+	}
 	w.Header().Set("Content-Type", "application/proto")
 	_, _ = w.Write(resp)
+}
+
+// handleChannels serves one text channel, "general" (id 77), for any clan.
+func (f *fakeMezon) handleChannels(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Authorization") != "Bearer "+f.session {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	d := protowire.AppendVarint(protowire.AppendTag(nil, 3, protowire.VarintType), 77)
+	d = protowire.AppendVarint(protowire.AppendTag(d, 6, protowire.VarintType), 1)
+	d = protowire.AppendString(protowire.AppendTag(d, 8, protowire.BytesType), "general")
+	w.Header().Set("Content-Type", "application/proto")
+	_, _ = w.Write(protowire.AppendBytes(protowire.AppendTag(nil, 1, protowire.BytesType), d))
 }
 
 // handleAccount serves the live Account wire: 1 user { 1 id i64, 2 username,
@@ -620,5 +646,87 @@ func TestDeregisterDoesNotRedial(t *testing.T) {
 	time.Sleep(500 * time.Millisecond) // several manager ticks
 	if after := dials.Load(); after != before {
 		t.Fatalf("deregistered bot re-dialed: %d → %d", before, after)
+	}
+}
+
+// A clan the bot is added to while its socket is open used to stay silent
+// until the socket happened to redial: the clan list was read once, at dial,
+// and only those clans were joined — so no message arrived, and the clan was
+// never enrolled. SyncClans must join it on the LIVE socket and report it,
+// with its text channels, for enrolment.
+func TestSyncClansJoinsClanAddedWhileConnected(t *testing.T) {
+	fake := &fakeMezon{
+		t: t, apiKey: "raw-api-key", appID: "2062754877070643200",
+		session: "session-jwt-token", clanID: "1780431535405535232",
+		replyCh: make(chan []byte, 4),
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	cfg := turbo.Config{
+		Tier: tier.Config{MaxHot: 5, Tick: 20 * time.Millisecond}, PollRPS: 100,
+		PollWorkers: 2, StateTTL: time.Hour, DedupCap: 128,
+	}
+	engine := turbo.New(cfg, rdb, rest.New(srv.URL), func(types.BotRef, types.Message) {})
+	ctx, cancel := testContext(t)
+	defer cancel()
+	go engine.Run(ctx)
+
+	bot := types.BotRef{KeyID: "k1", BotUserID: fake.appID, BotToken: fake.apiKey, TenantID: "t1"}
+	engine.Register(bot)
+	waitFor(t, 5*time.Second, "initial joins", func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return len(fake.joins) >= 2
+	})
+
+	const added = "2061345416372293632"
+	fake.mu.Lock()
+	fake.extraClans = append(fake.extraClans, added)
+	fake.mu.Unlock()
+
+	clans, err := engine.SyncClans(ctx, bot)
+	if err != nil {
+		t.Fatalf("sync clans: %v", err)
+	}
+	var got *turbo.ClanSnapshot
+	for i := range clans {
+		if clans[i].ID == added {
+			got = &clans[i]
+		}
+	}
+	if len(clans) != 2 || got == nil {
+		t.Fatalf("clans = %+v, want both clans", clans)
+	}
+	if got.Name != "clan-"+added || len(got.Channels) != 1 || got.Channels[0].Label != "general" {
+		t.Fatalf("new clan snapshot = %+v", *got)
+	}
+	waitFor(t, 5*time.Second, "live join of the added clan", func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		for _, j := range fake.joins {
+			if j == 2061345416372293632 {
+				return true
+			}
+		}
+		return false
+	})
+
+	// A second sync joins nothing new.
+	fake.mu.Lock()
+	before := len(fake.joins)
+	fake.mu.Unlock()
+	if _, err := engine.SyncClans(ctx, bot); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	fake.mu.Lock()
+	after := len(fake.joins)
+	fake.mu.Unlock()
+	if after != before {
+		t.Fatalf("re-sync re-joined clans: joins %d -> %d", before, after)
 	}
 }
