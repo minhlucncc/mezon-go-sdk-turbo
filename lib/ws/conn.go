@@ -211,7 +211,7 @@ func (c *Conn) request(env []byte, timeout time.Duration) (Ack, error) {
 	select {
 	case a := <-ch:
 		if a.Err {
-			return a, ErrRejected
+			return a, fmt.Errorf("%w: code=%d message=%q", ErrRejected, a.ErrCode, a.ErrMessage)
 		}
 		return a, nil
 	case <-time.After(timeout):

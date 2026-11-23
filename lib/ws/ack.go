@@ -22,6 +22,11 @@ type Ack struct {
 	Cid       uint64
 	MessageID string // the sent/edited message's id, when the server gave one
 	Err       bool   // the server answered with an Error envelope
+	// ErrCode/ErrMessage are the Error envelope's code and message (live
+	// Error: 1 code i32, 2 message str) — why the server refused, which a
+	// bare "rejected" hides.
+	ErrCode    int32
+	ErrMessage string
 }
 
 // DecodeAck reports whether frame is a reply to a cid'd request. It reads only
@@ -55,6 +60,14 @@ func DecodeAck(frame []byte) (Ack, bool) {
 			})
 		case num == envError && sub != nil:
 			hasReply, a.Err = true, true
+			walkVarints(sub, func(f protowire.Number, fv uint64, fs []byte) {
+				switch {
+				case f == 1 && fs == nil:
+					a.ErrCode = int32(fv)
+				case f == 2 && fs != nil:
+					a.ErrMessage = string(fs)
+				}
+			})
 		}
 	})
 	return a, hasCid && hasReply
