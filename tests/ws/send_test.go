@@ -1,6 +1,7 @@
 package ws_test
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 	"unicode/utf16"
@@ -310,5 +311,24 @@ func TestBuildPingEnvelopeWithCid(t *testing.T) {
 	})
 	if cid != 7 || !sawPing {
 		t.Fatalf("ping envelope wrong: cid=%d ping=%v", cid, sawPing)
+	}
+}
+
+// ChannelJoin matches the frame the official client sends when it opens a
+// private channel (captured live): Envelope field 4 {1 clan_id, 2 channel_id,
+// 3 channel_type=1}, is_public omitted when false.
+func TestBuildChannelJoinEnvelopeMatchesTheLiveClient(t *testing.T) {
+	var inner []byte
+	inner = protowire.AppendVarint(protowire.AppendTag(inner, 1, protowire.VarintType), 2061345416372293632)
+	inner = protowire.AppendVarint(protowire.AppendTag(inner, 2, protowire.VarintType), 2124691654219665408)
+	inner = protowire.AppendVarint(protowire.AppendTag(inner, 3, protowire.VarintType), 1)
+	want := protowire.AppendBytes(protowire.AppendTag(nil, 4, protowire.BytesType), inner)
+	got := ws.BuildChannelJoinEnvelope("2061345416372293632", "2124691654219665408", false)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("private join = %x, want %x", got, want)
+	}
+	pub := ws.BuildChannelJoinEnvelope("1", "2", true)
+	if len(pub) != len(ws.BuildChannelJoinEnvelope("1", "2", false))+2 {
+		t.Fatalf("public join should add is_public (field 4 = 1): %x", pub)
 	}
 }
