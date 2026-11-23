@@ -30,8 +30,14 @@ func errorFrame(cid uint64) []byte {
 	var env []byte
 	env = protowire.AppendTag(env, 1, protowire.VarintType)
 	env = protowire.AppendVarint(env, cid)
+	// live Error: 1 code i32, 2 message str
+	var e []byte
+	e = protowire.AppendTag(e, 1, protowire.VarintType)
+	e = protowire.AppendVarint(e, 7)
+	e = protowire.AppendTag(e, 2, protowire.BytesType)
+	e = protowire.AppendString(e, "no permission")
 	env = protowire.AppendTag(env, 12, protowire.BytesType)
-	return protowire.AppendBytes(env, []byte{})
+	return protowire.AppendBytes(env, e)
 }
 
 func TestDecodeAckReadsCidAndMessageID(t *testing.T) {
@@ -40,7 +46,7 @@ func TestDecodeAckReadsCidAndMessageID(t *testing.T) {
 		t.Fatalf("got %+v ok=%v", a, ok)
 	}
 	a, ok = ws.DecodeAck(errorFrame(9))
-	if !ok || a.Cid != 9 || !a.Err {
+	if !ok || a.Cid != 9 || !a.Err || a.ErrCode != 7 || a.ErrMessage != "no permission" {
 		t.Fatalf("error frame: got %+v ok=%v", a, ok)
 	}
 	// A pong carries a cid but no reply: not an ack.
@@ -155,6 +161,10 @@ func TestUpdateTextReportsRejection(t *testing.T) {
 	err := c.UpdateText("22", "11", "555", 2, true, "x", 2*time.Second)
 	if !errors.Is(err, ws.ErrRejected) {
 		t.Fatalf("err = %v, want ErrRejected", err)
+	}
+	// The server's reason survives, so a refused reply says why in the log.
+	if !strings.Contains(err.Error(), `code=7 message="no permission"`) {
+		t.Fatalf("err = %v, want the server's code and message", err)
 	}
 }
 
