@@ -18,12 +18,13 @@ import (
 
 // Envelope oneof field numbers (live rtapi.Envelope).
 const (
-	envClanJoin           = 3
-	envChannelMessage     = 6 // inbound; see decode.go
-	envChannelMessageSend = 8
-	envError              = 12
-	envPing               = 22
-	envTyping             = 24
+	envClanJoin             = 3
+	envChannelJoin          = 4
+	envChannelMessage       = 6 // inbound; see decode.go
+	envChannelMessageSend   = 8
+	envError                = 12
+	envPing                 = 22
+	envTyping               = 24
 	envMessageReactionEvent = 26
 )
 
@@ -128,6 +129,28 @@ func BuildSendEnvelopeRaw(channelID, clanID string, mode int32, isPublic bool, c
 	}
 	return appendMessageField(nil, envChannelMessageSend, msg)
 }
+
+// BuildChannelJoinEnvelope assembles the ChannelJoin envelope the official
+// client sends when it opens a channel (captured live: Envelope field 4,
+// ChannelJoin{1 clan_id i64, 2 channel_id i64, 3 channel_type i32,
+// 4 is_public bool}, is_public omitted when false).
+//
+// A private channel reaches a socket only if the bot was added to it while
+// that socket was open: a redial (deploy, dropped connection) loses it until
+// someone re-adds the bot. Joining it again on dial restores it.
+func BuildChannelJoinEnvelope(clanID, channelID string, isPublic bool) []byte {
+	var inner []byte
+	inner = appendVarintField(inner, 1, id(clanID))
+	inner = appendVarintField(inner, 2, id(channelID))
+	inner = appendVarintField(inner, 3, channelTypeText)
+	if isPublic {
+		inner = appendVarintField(inner, 4, 1)
+	}
+	return appendMessageField(nil, envChannelJoin, inner)
+}
+
+// channelTypeText is CHANNEL_TYPE_CHANNEL.
+const channelTypeText = 1
 
 // BuildClanJoinEnvelope assembles the ClanJoin envelope (live: clan_id i64).
 func BuildClanJoinEnvelope(clanID string) []byte {

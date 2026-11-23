@@ -107,6 +107,9 @@ type Engine struct {
 	clans     ClanLister     // nil → dial joins no clans
 	dir       ClanDirectory  // nil → SyncClans unsupported
 	accounts  AccountFetcher // nil → typing carries only names set on BotRef
+	// privateChannels lists the private channels a bot is known to be in;
+	// every socket joins them on dial (nil → none). See SetPrivateChannels.
+	privateChannels func(keyID string) []ChannelRef
 
 	mu sync.Mutex
 	// noChannels holds bots whose token may not list channels (a 403) and when
@@ -348,6 +351,43 @@ func (e *Engine) deliver(bot types.BotRef, msg types.Message) {
 
 // ── tier.Actuator ───────────────────────────────────────────────────────────
 
+// ChannelRef names one channel of a clan.
+type ChannelRef struct {
+	ClanID    string
+	ChannelID string
+}
+
+// SetPrivateChannels registers where the engine learns a bot's private
+// channels. Mezon delivers a private channel only to a socket that was open
+// when the bot was added to it, so every new socket (hot, or transient for a
+// send) joins these with ChannelJoin. Call before Run.
+func (e *Engine) SetPrivateChannels(fn func(keyID string) []ChannelRef) {
+	e.privateChannels = fn
+}
+
+// joinPrivateChannels sends ChannelJoin for the bot's known private channels
+// on a freshly dialed socket. Best-effort: a failed join is logged, never
+// fatal — the socket still serves the clan's public channels.
+func (e *Engine) joinPrivateChannels(bot types.BotRef, conn *ws.Conn) {
+	if e.privateChannels == nil {
+		return
+	}
+	joined := 0
+	for _, r := range e.privateChannels(bot.KeyID) {
+		if r.ClanID == "" || r.ChannelID == "" {
+			continue
+		}
+		if err := conn.JoinChannel(r.ClanID, r.ChannelID, false); err != nil {
+			log.Printf("private channel join failed (bot=%s channel=%s): %v", bot.BotUserID, r.ChannelID, err)
+			continue
+		}
+		joined++
+	}
+	if joined > 0 {
+		log.Printf("joined %d private channel(s) (bot=%s key=%s)", joined, bot.BotUserID, bot.KeyID)
+	}
+}
+
 // OpenHot opens a live socket for a bot (non-blocking enough for the manager;
 // on dial failure the bot is demoted back to Warm).
 func (e *Engine) OpenHot(bot types.BotRef) {
@@ -404,6 +444,7 @@ func (e *Engine) OpenHot(bot types.BotRef) {
 			return
 		}
 		log.Printf("hot socket open (bot=%s key=%s clans=%v)", bot.BotUserID, bot.KeyID, clanIDs)
+		e.joinPrivateChannels(bot, conn)
 
 		e.mu.Lock()
 		if _, stillWanted := e.opening[bot.KeyID]; !stillWanted {
@@ -482,6 +523,7 @@ func (e *Engine) SendTo(bot types.BotRef, channelID, clanID string, mode int32, 
 		return err
 	}
 	defer tmp.Close()
+	e.joinPrivateChannels(bot, tmp)
 	return tmp.SendTextOpts(channelID, clanID, mode, isPublic, text, opts)
 }
 
@@ -550,6 +592,7 @@ func (e *Engine) withConn(bot types.BotRef, fn func(*ws.Conn) error) error {
 		return err
 	}
 	defer tmp.Close()
+	e.joinPrivateChannels(bot, tmp)
 	return fn(tmp)
 }
 
@@ -591,6 +634,7 @@ func (e *Engine) SendReaction(bot types.BotRef, in types.Message, emojiID, emoji
 		return err
 	}
 	defer tmp.Close()
+	e.joinPrivateChannels(bot, tmp)
 	return tmp.SendReaction(in.ClanID, in.ChannelID, in.MessageID, emojiID, emoji, action, in.Mode, in.IsPublic)
 }
 
@@ -610,5 +654,6 @@ func (e *Engine) SendSticker(bot types.BotRef, in types.Message, stickerShortcod
 		return err
 	}
 	defer tmp.Close()
+	e.joinPrivateChannels(bot, tmp)
 	return tmp.SendSticker(in.ChannelID, in.ClanID, in.Mode, in.IsPublic, stickerShortcode, stickerURL)
 }

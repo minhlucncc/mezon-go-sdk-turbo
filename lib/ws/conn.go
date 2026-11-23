@@ -144,6 +144,13 @@ func (c *Conn) JoinClan(clanID string) error {
 	return nil
 }
 
+// JoinChannel subscribes the socket to one text channel (ChannelJoin). The
+// engine calls it on dial for the private channels a bot is known to be in,
+// which a fresh socket does not receive otherwise.
+func (c *Conn) JoinChannel(clanID, channelID string, isPublic bool) error {
+	return c.send(BuildChannelJoinEnvelope(clanID, channelID, isPublic))
+}
+
 // HasJoined reports whether this socket has joined the clan.
 func (c *Conn) HasJoined(clanID string) bool {
 	c.joinMu.Lock()

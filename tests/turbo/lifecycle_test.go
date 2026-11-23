@@ -3,12 +3,13 @@ package turbo_test
 import (
 	"context"
 	"encoding/base64"
-	"sync/atomic"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -67,6 +68,8 @@ type fakeMezon struct {
 	// bot tokens; channelCalls counts the calls it receives.
 	channelsForbidden bool
 	channelCalls      int
+	// channelJoins records every ChannelJoin frame as "clan/channel/public".
+	channelJoins []string
 }
 
 func (f *fakeMezon) handler() http.Handler {
@@ -98,7 +101,7 @@ func (f *fakeMezon) handleAuth(w http.ResponseWriter, r *http.Request) {
 	host := r.Host // session ROUTES the socket — same fake server here
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"token":  f.session,
+		"token":   f.session,
 		"user_id": f.appID,
 		"api_url": "http://" + host,
 		"ws_url":  host,
@@ -194,6 +197,12 @@ func (f *fakeMezon) handleWS(w http.ResponseWriter, r *http.Request) {
 				f.mu.Unlock()
 				continue
 			}
+			if j, ok := parseChannelJoin(data); ok {
+				f.mu.Lock()
+				f.channelJoins = append(f.channelJoins, j)
+				f.mu.Unlock()
+				continue
+			}
 			if isTypingEnvelope(data) && f.typingCh != nil {
 				f.typingCh <- data
 				continue
@@ -218,6 +227,46 @@ func (f *fakeMezon) push(frameB64 string) error {
 	conn := f.conn
 	f.mu.Unlock()
 	return conn.WriteMessage(websocket.BinaryMessage, frame)
+}
+
+// parseChannelJoin reads Envelope.channel_join (field 4: 1 clan_id i64,
+// 2 channel_id i64, 3 channel_type i32, 4 is_public bool) as
+// "clan/channel/public".
+func parseChannelJoin(b []byte) (string, bool) {
+	num, typ, n := protowire.ConsumeTag(b)
+	if n < 0 || num != 4 || typ != protowire.BytesType {
+		return "", false
+	}
+	inner, n2 := protowire.ConsumeBytes(b[n:])
+	if n2 < 0 {
+		return "", false
+	}
+	var clan, channel, ctype, public uint64
+	for len(inner) > 0 {
+		fn, ft, fn2 := protowire.ConsumeTag(inner)
+		if fn2 < 0 || ft != protowire.VarintType {
+			return "", false
+		}
+		v, vn := protowire.ConsumeVarint(inner[fn2:])
+		if vn < 0 {
+			return "", false
+		}
+		inner = inner[fn2+vn:]
+		switch fn {
+		case 1:
+			clan = v
+		case 2:
+			channel = v
+		case 3:
+			ctype = v
+		case 4:
+			public = v
+		}
+	}
+	if ctype != 1 {
+		return "", false
+	}
+	return fmt.Sprintf("%d/%d/%v", clan, channel, public != 0), true
 }
 
 func parseClanJoin(b []byte) (uint64, bool) {
@@ -482,7 +531,6 @@ func waitFor(t *testing.T, d time.Duration, what string, cond func() bool) {
 		}
 	}
 }
-
 
 func testContext(t *testing.T) (ctx context.Context, cancel context.CancelFunc) {
 	t.Helper()
@@ -788,5 +836,67 @@ func TestSyncClansStopsListingChannelsAfter403(t *testing.T) {
 	defer fake.mu.Unlock()
 	if fake.channelCalls != first {
 		t.Fatalf("channel listing retried after a 403: %d -> %d calls", first, fake.channelCalls)
+	}
+}
+
+// A private channel reaches a socket only if the bot was added to it while
+// that socket was open. Every dial — the first and each re-dial after a drop —
+// must re-join the bot's known private channels, or a deploy leaves the bot
+// deaf (and mute) there until someone re-adds it.
+func TestEveryDialRejoinsKnownPrivateChannels(t *testing.T) {
+	fake := &fakeMezon{
+		t:       t,
+		apiKey:  "raw-api-key",
+		appID:   "600",
+		session: "session-jwt-token",
+		clanID:  "777",
+		replyCh: make(chan []byte, 4),
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	cfg := turbo.Config{
+		WSSSL:       false,
+		Tier:        tier.Config{MaxHot: 5, Tick: 20 * time.Millisecond},
+		PollRPS:     100,
+		PollWorkers: 2,
+		StateTTL:    time.Hour,
+		DedupCap:    128,
+	}
+	engine := turbo.New(cfg, rdb, rest.New(srv.URL), func(types.BotRef, types.Message) {})
+	engine.SetPrivateChannels(func(keyID string) []turbo.ChannelRef {
+		if keyID != "k1" {
+			return nil
+		}
+		return []turbo.ChannelRef{{ClanID: "777", ChannelID: "4242"}, {ClanID: "", ChannelID: "9"}}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go engine.Run(ctx)
+
+	engine.Register(types.BotRef{KeyID: "k1", BotUserID: "600", BotToken: "raw-api-key", TenantID: "t1"})
+	joins := func() []string {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return append([]string(nil), fake.channelJoins...)
+	}
+	waitFor(t, 5*time.Second, "private channel joined on first dial", func() bool { return len(joins()) == 1 })
+	if got := joins()[0]; got != "777/4242/false" {
+		t.Fatalf("channel join = %q, want 777/4242/false (a ref without a clan is skipped)", got)
+	}
+
+	fake.mu.Lock()
+	first := fake.conn
+	fake.conn = nil
+	fake.mu.Unlock()
+	_ = first.Close()
+
+	waitFor(t, 10*time.Second, "private channel re-joined after re-dial", func() bool { return len(joins()) == 2 })
+	if got := joins()[1]; got != "777/4242/false" {
+		t.Fatalf("re-join = %q", got)
 	}
 }
